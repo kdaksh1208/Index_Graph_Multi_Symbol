@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NSE OI Tracker</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════════════
+     VIEW 1: SYMBOL PICKER  (shown on load, hidden after start)
+     ══════════════════════════════════════════════════════════ -->
+<div id="pickerView">
+
+  <div class="picker-bg">
+    <div class="picker-card">
+
+      <!-- Header -->
+      <div class="picker-header">
+        <div class="picker-logo">📈</div>
+        <div>
+          <h1 class="picker-title">NSE OI Tracker</h1>
+          <p class="picker-sub">Select symbols to monitor — then click Start Analysis</p>
+        </div>
+      </div>
+
+      <!-- Symbol loading state -->
+      <div id="pickerLoading" class="picker-loading">
+        <div class="picker-spinner"></div>
+        <span>Loading available symbols from NSE…</span>
+      </div>
+
+      <!-- Main selector (hidden until symbols load) -->
+      <div id="pickerContent" class="picker-content hidden">
+
+        <!-- Search bar -->
+        <div class="picker-search-wrap">
+          <span class="picker-search-icon">🔍</span>
+          <input id="pickerSearch" class="picker-search" type="text"
+                 placeholder="Search symbols… e.g. NIFTY, RELIANCE, TCS" autocomplete="off" />
+          <button class="picker-clear-btn" id="pickerClearSearch" title="Clear search">✕</button>
+        </div>
+
+        <!-- Selected chips row -->
+        <div id="selectedChipsWrap" class="selected-chips-wrap hidden">
+          <span class="chips-label">Selected:</span>
+          <div id="selectedChips" class="selected-chips"></div>
+          <button class="chip-clear-all" id="clearAllBtn" title="Remove all">Clear all</button>
+        </div>
+
+        <!-- Category tabs -->
+        <div class="picker-tabs">
+          <button class="picker-tab active" data-tab="indices">Indices <span id="idxCount" class="tab-badge">0</span></button>
+          <button class="picker-tab" data-tab="stocks">Stocks <span id="stkCount" class="tab-badge">0</span></button>
+          <button class="picker-tab" data-tab="all">All <span id="allCount" class="tab-badge">0</span></button>
+        </div>
+
+        <!-- Symbol grid -->
+        <div id="symbolGrid" class="symbol-grid"></div>
+
+        <!-- Empty search result -->
+        <div id="noResults" class="no-results hidden">
+          <span class="no-results-icon">🔎</span>
+          <p>No symbols match "<span id="noResultsTerm"></span>"</p>
+        </div>
+
+      </div>
+
+      <!-- Footer bar -->
+      <div class="picker-footer">
+        <div class="picker-selection-info">
+          <span id="selectionCount" class="selection-count">0 symbols selected</span>
+          <span class="selection-hint">Select at least 1 to continue</span>
+        </div>
+        <button id="startBtn" class="start-btn" disabled>
+          <span class="start-btn-icon">▶</span> Start Analysis
+        </button>
+      </div>
+
+    </div>
+  </div>
+
+</div><!-- /pickerView -->
+
+
+<!-- ══════════════════════════════════════════════════════════
+     VIEW 2: DASHBOARD  (hidden until analysis starts)
+     ══════════════════════════════════════════════════════════ -->
+<div id="dashboardView" class="hidden">
+
+  <!-- Header -->
+  <header class="app-header">
+    <div class="header-left">
+      <div class="logo-badge">📈</div>
+      <div class="header-titles">
+        <h1>NSE OI Tracker</h1>
+        <span class="subtitle">Real-time Support &amp; Resistance OI Delta Monitor</span>
+      </div>
+    </div>
+
+    <div class="header-center">
+      <div class="symbol-selector-wrap">
+        <label class="symbol-selector-label" for="symbolSelector">Symbol</label>
+        <select id="symbolSelector" class="symbol-selector" onchange="onSymbolChange(this.value)"></select>
+      </div>
+      <div class="nifty-price-card">
+        <span class="price-label" id="priceLabelText">—</span>
+        <span class="price-value" id="niftyPrice">—</span>
+      </div>
+      <div class="sr-badges">
+        <div class="sr-badge support-badge">
+          <span class="sr-label">Support</span>
+          <span class="sr-val" id="headerSupport">—</span>
+        </div>
+        <div class="sr-badge resistance-badge">
+          <span class="sr-label">Resistance</span>
+          <span class="sr-val" id="headerResistance">—</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <div class="cycle-counter">Cycle <span id="cycleNum">0</span></div>
+      <div class="status-dot" id="statusDot"></div>
+      <div class="last-update" id="lastUpdate">Waiting for first data…</div>
+    </div>
+  </header>
+
+  <!-- Status bar -->
+  <div class="status-bar">
+    <div class="status-bar-inner">
+      <span class="status-spinner" id="statusSpinner">⟳</span>
+      <span id="statusMsg">Initialising…</span>
+    </div>
+    <div class="progress-checkboxes">
+      <label class="check-item"><input type="checkbox" id="check1" disabled><span class="check-label">Connecting NSE</span></label>
+      <label class="check-item"><input type="checkbox" id="check2" disabled><span class="check-label">Downloading CSV</span></label>
+      <label class="check-item"><input type="checkbox" id="check3" disabled><span class="check-label">Processing Data</span></label>
+      <label class="check-item"><input type="checkbox" id="check4" disabled><span class="check-label">Calculations</span></label>
+    </div>
+    <div class="countdown-wrap">
+      <span id="countdown" class="countdown-display">—</span>
+    </div>
+  </div>
+
+  <!-- Dashboard -->
+  <main class="dashboard">
+
+    <section class="chart-card support-card">
+      <div class="card-header">
+        <div class="card-title-wrap">
+          <div class="card-icon support-icon">▲</div>
+          <div>
+            <h2 class="card-title">Support OI Delta</h2>
+            <p class="card-sub">
+              Strike: <strong id="supportStrike">—</strong> &nbsp;|&nbsp;
+              Put OI: <span id="supportPutOI">—</span> &nbsp;|&nbsp;
+              Call OI: <span id="supportCallOI">—</span>
+            </p>
+          </div>
+        </div>
+        <div class="chart-legend">
+          <span class="legend-dot put-dot"></span> Put OI Δ
+          <span class="legend-dot call-dot"></span> Call OI Δ
+        </div>
+      </div>
+      <div class="empty-state" id="supportEmpty">
+        <div class="empty-icon">⏳</div>
+        <p>Baseline loaded — waiting for second snapshot to plot deltas.</p>
+      </div>
+      <div id="supportChart" class="echart-container"></div>
+    </section>
+
+    <section class="chart-card resistance-card">
+      <div class="card-header">
+        <div class="card-title-wrap">
+          <div class="card-icon resistance-icon">▼</div>
+          <div>
+            <h2 class="card-title">Resistance OI Delta</h2>
+            <p class="card-sub">
+              Strike: <strong id="resistanceStrike">—</strong> &nbsp;|&nbsp;
+              Put OI: <span id="resistancePutOI">—</span> &nbsp;|&nbsp;
+              Call OI: <span id="resistanceCallOI">—</span>
+            </p>
+          </div>
+        </div>
+        <div class="chart-legend">
+          <span class="legend-dot put-dot"></span> Put OI Δ
+          <span class="legend-dot call-dot"></span> Call OI Δ
+        </div>
+      </div>
+      <div class="empty-state" id="resistanceEmpty">
+        <div class="empty-icon">⏳</div>
+        <p>Baseline loaded — waiting for second snapshot to plot deltas.</p>
+      </div>
+      <div id="resistanceChart" class="echart-container"></div>
+    </section>
+
+    <section class="chart-card table-card">
+      <div class="card-header">
+        <div class="card-title-wrap">
+          <div class="card-icon table-icon">☰</div>
+          <div>
+            <h2 class="card-title">Historical OI Snapshots</h2>
+            <p class="card-sub">All captured data points in this session</p>
+          </div>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table id="dataTable">
+          <thead>
+            <tr>
+              <th>Time</th><th>CMP</th>
+              <th>Support Strike</th><th>Sup Put OI</th><th>Sup Call OI</th>
+              <th>Sup Put Δ</th><th>Sup Call Δ</th>
+              <th>Resistance Strike</th><th>Res Put OI</th><th>Res Call OI</th>
+              <th>Res Put Δ</th><th>Res Call Δ</th>
+            </tr>
+          </thead>
+          <tbody id="tableBody">
+            <tr><td colspan="12" class="table-empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Loading overlay (shown during initial data fetch after start) -->
+  <div class="loading-overlay" id="loadingOverlay">
+    <div class="loading-box">
+      <div class="loading-spinner"></div>
+      <h3>Connecting to NSE…</h3>
+      <p>Please wait while we initialise the data feed.</p>
+      <div class="loading-steps">
+        <div class="step" id="step1">🌐 Connecting to NSE website</div>
+        <div class="step" id="step2">📡 Fetching option chain data</div>
+        <div class="step" id="step3">📊 Processing option chain</div>
+        <div class="step" id="step4">🔍 Identifying support &amp; resistance</div>
+        <div class="step" id="step5">✅ Initialising graphs</div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /dashboardView -->
+
+<!-- Toast container (always present so alerts show in picker view too) -->
+<div id="toastContainer" class="toast-container toast-right"></div>
+
+<script src="/static/script.js"></script>
+</body>
+</html>
