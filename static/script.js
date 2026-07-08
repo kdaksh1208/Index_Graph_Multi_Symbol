@@ -797,7 +797,7 @@ function evaluateAlertConditions(sym, support, resistance) {
     ? `🚨 ${sym} ALERT — ${sP} — Directional + Threshold`
     : `🚨 ${sym} ALERT — ${sP} — Directional Fulfilled`;
 
-  __showPopupAlert(sym, title, body);
+  _showPopupAlert(sym, title, body);
 
   _notifyBackendAlert(sym, title, sc, rc, sP, spd, scd, rpd, rcd, thMet, metrics);
 
