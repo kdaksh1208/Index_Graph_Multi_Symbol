@@ -53,6 +53,12 @@ active_symbols:   list = []
 symbol_data:      dict = {}
 analysis_started: bool = False
 
+# ── NEW (additive): symbol-wise price level alert storage ─────────────────────
+# Does not interact with, replace, or alter any existing analysis/data
+# structure above. Purely a separate dict for the new Price Level feature.
+price_levels: dict = {}   # { "NIFTY": 24500.0, "ABCCAPITAL": 180.0, ... }
+_price_levels_lock = threading.Lock()
+
 _state_lock    = threading.Lock()
 shutdown_event = threading.Event()
 _active_driver = None
@@ -614,8 +620,53 @@ def api_start_analysis():
     symbols = [s.upper() for s in body.get("symbols", []) if s]
     if not symbols:
         return jsonify({"error": "Provide non-empty 'symbols' list"}), 400
+
+    # ── NEW (additive): optional per-symbol price levels ─────────────────────
+    # Purely stores user-entered optional alert levels; does not affect
+    # symbol selection, the analysis thread, or any existing logic above.
+    raw_levels = body.get("price_levels") or {}
+    if isinstance(raw_levels, dict):
+        with _price_levels_lock:
+            for sym, lvl in raw_levels.items():
+                if lvl in (None, ""):
+                    continue
+                try:
+                    price_levels[str(sym).upper()] = float(lvl)
+                except (TypeError, ValueError):
+                    pass
+
     threading.Thread(target=_launch_analysis, args=(symbols,), daemon=True).start()
     return jsonify({"started": True, "symbols": symbols})
+
+
+# ── NEW (additive): Price Level Alert endpoints ──────────────────────────────
+# Independent of the analysis pipeline above — only stores/returns the
+# user-defined per-symbol price level used by the frontend's new
+# Price Level / Pro-Level alert evaluation.
+@app.route("/api/price-level/<sym>", methods=["GET", "POST"])
+def api_price_level(sym):
+    sym = sym.upper()
+    if request.method == "GET":
+        with _price_levels_lock:
+            return jsonify({"symbol": sym, "price_level": price_levels.get(sym)})
+
+    body  = request.get_json(force=True, silent=True) or {}
+    level = body.get("price_level")
+    with _price_levels_lock:
+        if level in (None, ""):
+            price_levels.pop(sym, None)
+        else:
+            try:
+                price_levels[sym] = float(level)
+            except (TypeError, ValueError):
+                return jsonify({"error": "price_level must be numeric"}), 400
+    return jsonify({"symbol": sym, "price_level": price_levels.get(sym)})
+
+
+@app.route("/api/price-levels")
+def api_price_levels_all():
+    with _price_levels_lock:
+        return jsonify(dict(price_levels))
 
 
 @app.route("/api/analysis-state")

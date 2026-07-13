@@ -32,6 +32,11 @@
         <span>Loading available symbols from NSE…</span>
       </div>
 
+      <!-- NEW (additive): hint about optional per-symbol price alert -->
+      <p class="picker-price-hint" id="pickerPriceHint">
+        💡 Tip: after selecting a symbol below, you can optionally set a price level for alerts next to its chip.
+      </p>
+
       <!-- Main selector (hidden until symbols load) -->
       <div id="pickerContent" class="picker-content hidden">
 
@@ -105,6 +110,17 @@
         <label class="symbol-selector-label" for="symbolSelector">Symbol</label>
         <select id="symbolSelector" class="symbol-selector" onchange="onSymbolChange(this.value)"></select>
       </div>
+
+      <!-- NEW (additive): per-symbol price level alert control -->
+      <div class="price-level-wrap" id="priceLevelWrap">
+        <label class="price-level-label" for="priceLevelInput">Set Price Level</label>
+        <div class="price-level-input-row">
+          <input id="priceLevelInput" class="price-level-input" type="number" step="any"
+                 placeholder="e.g. 24500" title="Optional price level alert for the selected symbol" />
+          <button id="setPriceLevelBtn" class="set-price-btn" type="button" title="Save price level for this symbol">Set</button>
+        </div>
+      </div>
+
       <div class="nifty-price-card">
         <span class="price-label" id="priceLabelText">—</span>
         <span class="price-value" id="niftyPrice">—</span>
@@ -248,6 +264,11 @@
 
 <!-- Toast container (always present so alerts show in picker view too) -->
 <div id="toastContainer" class="toast-container toast-right"></div>
+
+<!-- NEW (additive): dedicated TOP alert container for Price Level & Pro-Level
+     alerts only. Existing directional alerts keep using #toastContainer
+     (bottom-left/right) untouched. -->
+<div id="topAlertContainer" class="top-alert-container"></div>
 
 <script src="/static/script.js"></script>
 </body>

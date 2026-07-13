@@ -31,6 +31,10 @@ let _selectedSet = new Set();
 let _activeTab   = "indices";
 let _searchQuery = "";
 
+/* NEW (additive): optional per-symbol price levels entered at the picker
+   stage. Purely additional state — does not affect symbol selection. */
+let _priceLevels = {};
+
 /* Poll /api/available-symbols until fetched=true */
 async function _loadSymbols() {
   while (true) {
@@ -125,11 +129,22 @@ function _renderChips() {
   wrap.classList.remove("hidden");
   chips.innerHTML = [..._selectedSet].map(sym =>
     `<span class="sel-chip">${sym}
+      <input type="number" step="any" class="sel-chip-price" data-sym="${sym}"
+             placeholder="Alert price" title="Optional price level alert for ${sym}"
+             value="${_priceLevels[sym] ?? ""}">
       <button class="sel-chip-x" data-sym="${sym}" title="Remove">×</button>
     </span>`
   ).join("");
   chips.querySelectorAll(".sel-chip-x").forEach(btn => {
     btn.addEventListener("click", () => _toggleSymbol(btn.dataset.sym));
+  });
+  // NEW (additive): capture the optional per-symbol price level
+  chips.querySelectorAll(".sel-chip-price").forEach(inp => {
+    inp.addEventListener("input", () => {
+      const sym = inp.dataset.sym;
+      if (inp.value === "") { delete _priceLevels[sym]; }
+      else { _priceLevels[sym] = inp.value; }
+    });
   });
 }
 
@@ -196,7 +211,7 @@ async function _startAnalysis() {
     const r = await fetch("/api/start-analysis", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ symbols }),
+      body:    JSON.stringify({ symbols, price_levels: _priceLevels }), // price_levels: NEW, additive
     });
     const d = await r.json();
     if (d.started) {
@@ -265,6 +280,12 @@ function _initDashboard(symbols) {
   activeSymbol = symbols[0];
   document.getElementById("priceLabelText").textContent = activeSymbol;
 
+  // NEW (additive): seed price levels captured at the picker stage,
+  // then reflect the active symbol's level in the header input.
+  _initPriceLevelsFromPicker(symbols);
+  const _plInput = document.getElementById("priceLevelInput");
+  if (_plInput) _plInput.value = priceLevels[activeSymbol] ?? "";
+
   initCharts();
   _resetCheckboxes();
   _applyToastPosition(activeSymbol);
@@ -293,6 +314,10 @@ function onSymbolChange(sym) {
   activeSymbol = sym;
   const label = document.getElementById("priceLabelText");
   if (label) label.textContent = sym;
+
+  // NEW (additive): show this symbol's own price level in the header control
+  const _plInput = document.getElementById("priceLevelInput");
+  if (_plInput) _plInput.value = priceLevels[sym] ?? "";
 
   if (symState[sym]?.firstDataLoaded && _cachedApiResponse[sym]) {
     const { support, resistance, current, status: st } = _cachedApiResponse[sym];
@@ -586,6 +611,10 @@ async function pollData(sym) {
       return;
     }
 
+    // NEW (additive): evaluate Price Level / Pro-Level alerts. Independent
+    // of, and does not alter, the existing directional alert evaluation below.
+    evaluatePriceLevelAlerts(sym, support, resistance, current);
+
     const isNew = history_len > ss.lastHistoryLen;
     if (isNew) {
       ss.lastNewDataTime = Date.now();
@@ -815,16 +844,185 @@ function fmtDelta(n) {
   return n > 0 ? `+${s}` : s;
 }
 
+/* ══════════════════════════════════════════════════════════════
+   NEW (additive): PRICE LEVEL ALERT SYSTEM
+   - Does not modify the existing directional alert system above
+     (evaluateAlertConditions, _getPattern, _threshold, _showPopupAlert,
+     _notifyBackendAlert are all left completely untouched).
+   - Adds: symbol-wise price level storage, a "Price Level" alert,
+     and a combined "Pro-Level" alert (price level + existing
+     directional pattern condition), shown in a dedicated TOP
+     container — never in the existing bottom-left/right toasts.
+   ══════════════════════════════════════════════════════════════ */
+
+/* symbol -> active numeric price level used by the dashboard */
+const priceLevels = {};
+
+/* symbol -> { side: 'above' | 'below' | 'equal' | null } — used only to
+   detect a match/cross event instead of re-firing every single poll. */
+const _priceLevelState = {};
+
+/* Tracks whether a price level was freshly set by the user (picker or Set button)
+   so the first evaluation fires an alert when price equals the level, without
+   re-triggering on subsequent polls. Never set on page refresh. */
+const _priceLevelDirty = {};
+
+function _initPriceLevelsFromPicker(symbols) {
+  symbols.forEach(sym => {
+    const raw = _priceLevels[sym];
+    if (raw !== undefined && raw !== "" && !isNaN(parseFloat(raw))) {
+      priceLevels[sym] = parseFloat(raw);
+      _priceLevelDirty[sym] = true;
+    }
+    _priceLevelState[sym] = { side: null };
+  });
+}
+
+/* Dedicated TOP-of-screen alert renderer (Price Level / Pro-Level only). */
+function _showTopAlert(sym, title, bodyHtml, cssClass, duration = ALERT_DURATION_MS) {
+  const c = document.getElementById("topAlertContainer");
+  if (!c) return;
+  const el = document.createElement("div");
+  el.className = `top-alert ${cssClass}`;
+  el.innerHTML = `<div class="top-alert-body"><strong>${title}</strong>
+      <div class="top-alert-details">${bodyHtml}</div></div>
+    <button class="top-alert-close" aria-label="Dismiss">×</button>`;
+  el.querySelector(".top-alert-close")?.addEventListener("click", () => _removeEl(el), { once: true });
+  c.appendChild(el);
+  setTimeout(() => _removeEl(el), duration);
+}
+
+/* Reads whether the EXISTING directional pattern condition currently holds,
+   by reusing the existing pure helper `_getPattern` (read-only use — the
+   helper itself is not modified). This lets the Pro-Level alert check the
+   same directional condition without touching evaluateAlertConditions. */
+function _currentDirectionalPattern(support, resistance) {
+  if (!Array.isArray(support) || support.length < 2 || !Array.isArray(resistance) || resistance.length < 2) return null;
+  const sc = support.at(-1), rc = resistance.at(-1);
+  if (!sc || !rc) return null;
+  const spd = +(sc.put_delta ?? 0), scd = +(sc.call_delta ?? 0);
+  const rpd = +(rc.put_delta ?? 0), rcd = +(rc.call_delta ?? 0);
+  const sP = _getPattern(spd, scd), rP = _getPattern(rpd, rcd);
+  return (sP && rP && sP === rP) ? sP : null;
+}
+
+/* After a price-level match/cross, ask whether to change the level. */
+function _promptPriceLevelUpdate(sym) {
+  const changeIt = confirm(`Do you want to change the price level for ${sym}? (OK = Yes, Cancel = No)`);
+  if (!changeIt) return;
+  const val = prompt(`Enter new price level for ${sym}:`, priceLevels[sym] ?? "");
+  if (val === null || val.trim() === "" || isNaN(parseFloat(val))) return;
+  const newLevel = parseFloat(val);
+  priceLevels[sym] = newLevel;
+  _priceLevelState[sym] = { side: null };
+  _priceLevelDirty[sym] = true;
+  if (sym === activeSymbol) {
+    const inp = document.getElementById("priceLevelInput");
+    if (inp) inp.value = newLevel;
+  }
+  fetch(`/api/price-level/${sym}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ price_level: newLevel }),
+  }).catch(err => console.error("[price-level-update]", err));
+}
+
+/* Core evaluator: fires the Price Level alert (B) or, when the existing
+   directional pattern also holds, the combined Pro-Level alert (C).
+   Runs on every poll for `sym`; a no-op if no level has been set. */
+function evaluatePriceLevelAlerts(sym, support, resistance, current) {
+  const level = priceLevels[sym];
+  if (level === undefined || level === null || level === "" || isNaN(level)) return;
+  if (!current || current.cmp === undefined || current.cmp === null) return;
+
+  const cmp = +current.cmp;
+  const newSide = cmp > level ? "above" : cmp < level ? "below" : "equal";
+
+  if (!_priceLevelState[sym]) _priceLevelState[sym] = { side: null };
+  const prevSide = _priceLevelState[sym].side;
+
+  const justSet = _priceLevelDirty[sym] === true;
+  const matched = justSet
+    ? newSide === "equal"
+    : prevSide !== null && newSide !== prevSide;
+
+  if (justSet) _priceLevelDirty[sym] = false;
+  _priceLevelState[sym].side = newSide;
+
+  if (!matched) return;
+
+  const pattern = _currentDirectionalPattern(support, resistance);
+  const detail  = _formatDetail("CMP", fmtNum(cmp)) + _formatDetail("Price Level", fmtNum(level));
+
+  if (pattern) {
+    const title = `🚨 Price Level + Directional Pattern Matched for ${sym}`;
+    _showTopAlert(sym, title, detail + _formatDetail("Pattern", pattern), "top-alert-pro");
+    fetch("/api/alert-notify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message:
+        `${title}\nSymbol: ${sym}\nCMP: ${fmtNum(cmp)}\nPrice Level: ${fmtNum(level)}\nPattern: ${pattern}` }),
+    }).catch(err => console.error("[alert-notify]", err));
+  } else {
+    const title = `🔔 Price Level Matched for ${sym}`;
+    _showTopAlert(sym, title, detail, "top-alert-price");
+    fetch("/api/alert-notify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message:
+        `${title}\nSymbol: ${sym}\nCMP: ${fmtNum(cmp)}\nPrice Level: ${fmtNum(level)}` }),
+    }).catch(err => console.error("[alert-notify]", err));
+  }
+
+  setTimeout(() => _promptPriceLevelUpdate(sym), 300);
+}
+
+/* "Set Price Level" button in the dashboard header — a standalone
+   listener added independently of the existing boot sequence below. */
+document.addEventListener("DOMContentLoaded", () => {
+  const btn = document.getElementById("setPriceLevelBtn");
+  const inp = document.getElementById("priceLevelInput");
+  if (!btn || !inp) return;
+  btn.addEventListener("click", () => {
+    if (!activeSymbol) return;
+    const val = inp.value;
+    if (val === "" || isNaN(parseFloat(val))) return;
+    const newLevel = parseFloat(val);
+    priceLevels[activeSymbol] = newLevel;
+    _priceLevelState[activeSymbol] = { side: null };
+    _priceLevelDirty[activeSymbol] = true;
+    showToast("success", `🔔 Price Level Set`, `${activeSymbol} alert at ${fmtNum(newLevel)}`);
+    fetch(`/api/price-level/${activeSymbol}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ price_level: newLevel }),
+    }).catch(err => console.error("[price-level-set]", err));
+  });
+});
+
 /* ── Boot ────────────────────────────────────────────────────── */
 document.addEventListener("DOMContentLoaded", () => {
-  // Check if analysis is already running (e.g. page refresh)
-  fetch("/api/analysis-state").then(r => r.json()).then(d => {
-    if (d.started && d.symbols?.length > 0) {
-      // Skip picker, jump straight to dashboard
-      _switchToDashboard(d.symbols);
-    } else {
-      // Show picker
+  (async () => {
+    try {
+      const r = await fetch("/api/analysis-state");
+      const d = await r.json();
+      if (d.started && d.symbols?.length > 0) {
+        // Restore price levels from backend on page refresh
+        try {
+          const plResp = await fetch("/api/price-levels");
+          const plData = await plResp.json();
+          if (plData && typeof plData === "object") {
+            for (const [sym, level] of Object.entries(plData)) {
+              _priceLevels[sym] = level;
+            }
+          }
+        } catch (_) {}
+        _switchToDashboard(d.symbols);
+      } else {
+        _initPicker();
+      }
+    } catch (_) {
       _initPicker();
     }
-  }).catch(() => _initPicker());
+  })();
 });
