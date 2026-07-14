@@ -59,6 +59,11 @@ analysis_started: bool = False
 price_levels: dict = {}   # { "NIFTY": 24500.0, "ABCCAPITAL": 180.0, ... }
 _price_levels_lock = threading.Lock()
 
+# ── NEW (additive): user-configurable analysis interval (seconds) ─────────────
+# Single source of truth for the fetch cadence, replacing the previous
+# hardcoded 120s. Default kept at 900s (0h 15m) as the new default.
+analysis_interval_seconds: int = 15 * 60
+
 _state_lock    = threading.Lock()
 shutdown_event = threading.Event()
 _active_driver = None
@@ -525,7 +530,7 @@ def _data_loop_for_symbol(sym):
         _set_status(sym, f"❌ {exc}", fetching=False, error=str(exc))
 
     while True:
-        if _sleep_or_stop(120):
+        if _sleep_or_stop(analysis_interval_seconds):
             break
         if shutdown_event.is_set():
             break
@@ -613,7 +618,7 @@ def api_available_symbols():
 
 @app.route("/api/start-analysis", methods=["POST"])
 def api_start_analysis():
-    global analysis_started
+    global analysis_started, analysis_interval_seconds
     if analysis_started:
         return jsonify({"error": "Analysis already running"}), 400
     body    = request.get_json(force=True, silent=True) or {}
@@ -622,8 +627,6 @@ def api_start_analysis():
         return jsonify({"error": "Provide non-empty 'symbols' list"}), 400
 
     # ── NEW (additive): optional per-symbol price levels ─────────────────────
-    # Purely stores user-entered optional alert levels; does not affect
-    # symbol selection, the analysis thread, or any existing logic above.
     raw_levels = body.get("price_levels") or {}
     if isinstance(raw_levels, dict):
         with _price_levels_lock:
@@ -635,9 +638,17 @@ def api_start_analysis():
                 except (TypeError, ValueError):
                     pass
 
+    # ── NEW (additive): optional user-selected analysis interval ─────────────
+    raw_interval = body.get("interval_seconds")
+    try:
+        iv = int(raw_interval)
+        if iv > 0:
+            analysis_interval_seconds = iv
+    except (TypeError, ValueError):
+        pass
+
     threading.Thread(target=_launch_analysis, args=(symbols,), daemon=True).start()
     return jsonify({"started": True, "symbols": symbols})
-
 
 # ── NEW (additive): Price Level Alert endpoints ──────────────────────────────
 # Independent of the analysis pipeline above — only stores/returns the
@@ -671,7 +682,11 @@ def api_price_levels_all():
 
 @app.route("/api/analysis-state")
 def api_analysis_state():
-    return jsonify({"started": analysis_started, "symbols": active_symbols})
+    return jsonify({
+        "started": analysis_started,
+        "symbols": active_symbols,
+        "interval_seconds": analysis_interval_seconds,  # NEW, additive
+    })
 
 
 @app.route("/api/status")

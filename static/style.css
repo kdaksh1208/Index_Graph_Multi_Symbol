@@ -996,3 +996,53 @@ tbody td:first-child { text-align: left; font-weight: 600; color: var(--blue); }
   .price-level-input { width: 84px; }
   .top-alert-container { width: 94vw; }
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   NEW (additive): TIME INTERVAL FOR ANALYSIS — picker-stage input.
+   ═══════════════════════════════════════════════════════════════ */
+.interval-select-wrap {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.interval-fields { display: flex; gap: 12px; }
+
+.interval-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.interval-field label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-muted);
+}
+
+.interval-input {
+  width: 76px;
+  padding: 6px 8px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  background: var(--surface3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  color: var(--text);
+}
+.interval-input:focus {
+  outline: none;
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(88,166,255,0.15);
+}
+
+@media (max-width: 560px) {
+  .interval-select-wrap { flex-direction: column; align-items: stretch; }
+  .interval-fields { justify-content: center; }
+}

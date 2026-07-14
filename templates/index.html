@@ -54,7 +54,20 @@
           <div id="selectedChips" class="selected-chips"></div>
           <button class="chip-clear-all" id="clearAllBtn" title="Remove all">Clear all</button>
         </div>
-
+        <!-- NEW (additive): Time Interval for Analysis -->
+        <div class="interval-select-wrap" id="intervalSelectWrap">
+          <span class="chips-label">Time Interval for Analysis</span>
+          <div class="interval-fields">
+            <div class="interval-field">
+              <label for="intervalHours">Hours</label>
+              <input type="number" id="intervalHours" class="interval-input" min="0" value="0" />
+            </div>
+            <div class="interval-field">
+              <label for="intervalMinutes">Minutes</label>
+              <input type="number" id="intervalMinutes" class="interval-input" min="0" max="59" value="15" />
+            </div>
+          </div>
+        </div>
         <!-- Category tabs -->
         <div class="picker-tabs">
           <button class="picker-tab active" data-tab="indices">Indices <span id="idxCount" class="tab-badge">0</span></button>

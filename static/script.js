@@ -8,9 +8,10 @@
    ══════════════════════════════════════════════════════════════ */
 
 /* ── CONFIG ──────────────────────────────────────────────────── */
+// was: const DATA_POLL_MS = 5_000; ... const CYCLE_INTERVAL = 120_000;
 const DATA_POLL_MS            =   5_000;
 const STATUS_POLL_MS          =   1_000;
-const CYCLE_INTERVAL          = 120_000;
+let   CYCLE_INTERVAL          = 15 * 60 * 1000; // NEW: user-configurable, default 0h 15m
 const ALERT_DURATION_MS       =  75_000;
 const CYCLE_TOAST_DURATION_MS =   3_000;
 
@@ -207,11 +208,26 @@ async function _startAnalysis() {
   btn.disabled    = true;
   btn.textContent = "Starting…";
 
+  // NEW (additive): Time Interval for Analysis (Hours/Minutes), default 0h 15m.
+  const hEl = document.getElementById("intervalHours");
+  const mEl = document.getElementById("intervalMinutes");
+  let hours   = parseInt(hEl?.value, 10);
+  let minutes = parseInt(mEl?.value, 10);
+  if (isNaN(hours)   || hours   < 0) hours   = 0;
+  if (isNaN(minutes) || minutes < 0) minutes = 15;
+  if (hours === 0 && minutes === 0) minutes = 15; // never allow a 0 interval
+  const intervalSeconds = hours * 3600 + minutes * 60;
+  CYCLE_INTERVAL = intervalSeconds * 1000;
+
   try {
     const r = await fetch("/api/start-analysis", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ symbols, price_levels: _priceLevels }), // price_levels: NEW, additive
+      body:    JSON.stringify({
+        symbols,
+        price_levels: _priceLevels,        // unchanged
+        interval_seconds: intervalSeconds, // NEW, additive
+      }),
     });
     const d = await r.json();
     if (d.started) {
@@ -227,7 +243,6 @@ async function _startAnalysis() {
     btn.textContent = "▶ Start Analysis";
   }
 }
-
 
 /* ════════════════════════════════════════════════════════════════
    TRANSITION — picker → dashboard
@@ -1007,6 +1022,9 @@ document.addEventListener("DOMContentLoaded", () => {
       const r = await fetch("/api/analysis-state");
       const d = await r.json();
       if (d.started && d.symbols?.length > 0) {
+        // NEW (additive): restore the user-selected interval on refresh
+        if (d.interval_seconds) CYCLE_INTERVAL = d.interval_seconds * 1000;
+
         // Restore price levels from backend on page refresh
         try {
           const plResp = await fetch("/api/price-levels");
