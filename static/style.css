@@ -1046,3 +1046,15 @@ tbody td:first-child { text-align: left; font-weight: 600; color: var(--blue); }
   .interval-select-wrap { flex-direction: column; align-items: stretch; }
   .interval-fields { justify-content: center; }
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   NEW (additive): BREAKOUT ALERT — distinct style, reuses the
+   existing .top-alert / .top-alert-container mechanics untouched.
+   ═══════════════════════════════════════════════════════════════ */
+.top-alert-breakout {
+  background: rgba(20, 40, 30, 0.97);
+  border: 1px solid var(--green);
+  border-left: 5px solid var(--green);
+  box-shadow: 0 0 0 1px rgba(63,185,80,0.25), var(--shadow-lg);
+}
+.top-alert-breakout .top-alert-body strong { color: var(--green); }

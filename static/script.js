@@ -626,11 +626,14 @@ async function pollData(sym) {
       return;
     }
 
-    // NEW (additive): evaluate Price Level / Pro-Level alerts. Independent
-    // of, and does not alter, the existing directional alert evaluation below.
-    evaluatePriceLevelAlerts(sym, support, resistance, current);
-
     const isNew = history_len > ss.lastHistoryLen;
+
+    // NEW (additive): evaluate Price Level / Pro-Level / Breakout alerts.
+    // Independent of, and does not alter, the existing directional alert
+    // evaluation below. isNew tells the evaluator whether this poll
+    // represents a genuinely new "closing" data point (a new cycle),
+    // vs. just a routine 5s status refresh.
+    evaluatePriceLevelAlerts(sym, support, resistance, current, isNew);
     if (isNew) {
       ss.lastNewDataTime = Date.now();
       ss.lastHistoryLen  = history_len;
@@ -882,6 +885,22 @@ const _priceLevelState = {};
    re-triggering on subsequent polls. Never set on page refresh. */
 const _priceLevelDirty = {};
 
+/* NEW (additive): ±0.1% band tolerance used ONLY by the combined
+   "Price Level + Directional" (Pro-Level) alert. The plain Price Level
+   alert's crossing behaviour above/below the exact level is unchanged. */
+const PRO_LEVEL_BAND_PCT = 0.001;
+
+/* NEW (additive): symbol -> whether CMP is currently inside the Pro-Level
+   band, so the combined alert fires once per entry into the band rather
+   than on every poll while price stays inside it. */
+const _proBandState = {};
+
+/* NEW (additive): symbol -> the active rolling 5-close breakout tracker,
+   started fresh by the most recent plain Price Level crossing. A new
+   crossing always replaces any in-progress tracker for that symbol,
+   satisfying "independently for every price level crossing". */
+const _breakoutTracker = {};
+
 function _initPriceLevelsFromPicker(symbols) {
   symbols.forEach(sym => {
     const raw = _priceLevels[sym];
@@ -893,7 +912,7 @@ function _initPriceLevelsFromPicker(symbols) {
   });
 }
 
-/* Dedicated TOP-of-screen alert renderer (Price Level / Pro-Level only). */
+/* Dedicated TOP-of-screen alert renderer (Price Level / Pro-Level / Breakout only). */
 function _showTopAlert(sym, title, bodyHtml, cssClass, duration = ALERT_DURATION_MS) {
   const c = document.getElementById("topAlertContainer");
   if (!c) return;
@@ -909,8 +928,7 @@ function _showTopAlert(sym, title, bodyHtml, cssClass, duration = ALERT_DURATION
 
 /* Reads whether the EXISTING directional pattern condition currently holds,
    by reusing the existing pure helper `_getPattern` (read-only use — the
-   helper itself is not modified). This lets the Pro-Level alert check the
-   same directional condition without touching evaluateAlertConditions. */
+   helper itself is not modified). */
 function _currentDirectionalPattern(support, resistance) {
   if (!Array.isArray(support) || support.length < 2 || !Array.isArray(resistance) || resistance.length < 2) return null;
   const sc = support.at(-1), rc = resistance.at(-1);
@@ -921,7 +939,7 @@ function _currentDirectionalPattern(support, resistance) {
   return (sP && rP && sP === rP) ? sP : null;
 }
 
-/* After a price-level match/cross, ask whether to change the level. */
+/* After a price-level crossing alert fires, ask whether to change the level. */
 function _promptPriceLevelUpdate(sym) {
   const changeIt = confirm(`Do you want to change the price level for ${sym}? (OK = Yes, Cancel = No)`);
   if (!changeIt) return;
@@ -931,6 +949,7 @@ function _promptPriceLevelUpdate(sym) {
   priceLevels[sym] = newLevel;
   _priceLevelState[sym] = { side: null };
   _priceLevelDirty[sym] = true;
+  delete _breakoutTracker[sym];
   if (sym === activeSymbol) {
     const inp = document.getElementById("priceLevelInput");
     if (inp) inp.value = newLevel;
@@ -942,44 +961,54 @@ function _promptPriceLevelUpdate(sym) {
   }).catch(err => console.error("[price-level-update]", err));
 }
 
-/* Core evaluator: fires the Price Level alert (B) or, when the existing
-   directional pattern also holds, the combined Pro-Level alert (C).
-   Runs on every poll for `sym`; a no-op if no level has been set. */
-function evaluatePriceLevelAlerts(sym, support, resistance, current) {
+/* ══════════════════════════════════════════════════════════════
+   Core evaluator — three independent alerts, sharing the same
+   configured price level, but each with its own trigger condition:
+
+   1) Plain "Price Level" alert (2nd alert) — UNCHANGED: fires on an
+      exact crossing (side flips above/below, or exact equality on
+      first set). Also (NEW) kicks off the rolling 5-close breakout
+      tracker described in Feature 2.
+
+   2) "Price Level + Directional" alert (3rd alert) — NEW: instead of
+      requiring CMP to exactly equal the level, fires whenever CMP is
+      within a ±0.1% band around the level AND the existing directional
+      pattern condition also currently holds. Fires once per entry into
+      the band.
+
+   3) Breakout alert (NEW, Feature 2) — once the plain Price Level alert
+      fires, the next 5 closing CMPs are stored. Once that window is
+      full, each subsequent closing price is compared against the
+      window's maximum; if it exceeds it, a breakout alert fires, and
+      the window slides forward by one close either way.
+   ══════════════════════════════════════════════════════════════ */
+function evaluatePriceLevelAlerts(sym, support, resistance, current, isNewClose) {
   const level = priceLevels[sym];
   if (level === undefined || level === null || level === "" || isNaN(level)) return;
   if (!current || current.cmp === undefined || current.cmp === null) return;
 
   const cmp = +current.cmp;
-  const newSide = cmp > level ? "above" : cmp < level ? "below" : "equal";
+  // NEW: two-state side (no ambiguous "equal" middle state), so a
+  // crossing is unambiguous: exactly one flip from "above" to "below"
+  // or vice versa fires the alert. Remaining on the same side — even
+  // if CMP moves around while staying above/below — never re-fires.
+  const newSide = cmp >= level ? "above" : "below";
 
   if (!_priceLevelState[sym]) _priceLevelState[sym] = { side: null };
   const prevSide = _priceLevelState[sym].side;
 
   const justSet = _priceLevelDirty[sym] === true;
-  const matched = justSet
-    ? newSide === "equal"
-    : prevSide !== null && newSide !== prevSide;
+  // On first set (dirty), just record which side CMP currently sits on —
+  // there's no "previous side" yet, so no crossing has occurred and no
+  // alert should fire. The alert only fires on a later, genuine crossing.
+  const matched = justSet ? false : (prevSide !== null && newSide !== prevSide);
 
   if (justSet) _priceLevelDirty[sym] = false;
   _priceLevelState[sym].side = newSide;
-
-  if (!matched) return;
-
-  const pattern = _currentDirectionalPattern(support, resistance);
-  const detail  = _formatDetail("CMP", fmtNum(cmp)) + _formatDetail("Price Level", fmtNum(level));
-
-  if (pattern) {
-    const title = `🚨 Price Level + Directional Pattern Matched for ${sym}`;
-    _showTopAlert(sym, title, detail + _formatDetail("Pattern", pattern), "top-alert-pro");
-    fetch("/api/alert-notify", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message:
-        `${title}\nSymbol: ${sym}\nCMP: ${fmtNum(cmp)}\nPrice Level: ${fmtNum(level)}\nPattern: ${pattern}` }),
-    }).catch(err => console.error("[alert-notify]", err));
-  } else {
-    const title = `🔔 Price Level Matched for ${sym}`;
+  /* ── 1) Plain Price Level alert — crossing logic unchanged ─────────── */
+  if (matched) {
+    const detail = _formatDetail("CMP", fmtNum(cmp)) + _formatDetail("Price Level", fmtNum(level));
+    const title  = `🔔 Price Level Matched for ${sym}`;
     _showTopAlert(sym, title, detail, "top-alert-price");
     fetch("/api/alert-notify", {
       method: "POST",
@@ -987,9 +1016,90 @@ function evaluatePriceLevelAlerts(sym, support, resistance, current) {
       body: JSON.stringify({ message:
         `${title}\nSymbol: ${sym}\nCMP: ${fmtNum(cmp)}\nPrice Level: ${fmtNum(level)}` }),
     }).catch(err => console.error("[alert-notify]", err));
+
+    // NEW (additive): (re)start the rolling 5-close breakout tracker for
+    // this symbol — independent for every new crossing.
+    _breakoutTracker[sym] = {
+      level,
+      crossingCmp: cmp,
+      window: [],
+      complete: false,
+    };
+
+    setTimeout(() => _promptPriceLevelUpdate(sym), 300);
   }
 
-  setTimeout(() => _promptPriceLevelUpdate(sym), 300);
+  /* ── 2) Price Level + Directional (Pro-Level) alert — ±0.1% band ───── */
+  const lowerBand = level * (1 - PRO_LEVEL_BAND_PCT);
+  const upperBand = level * (1 + PRO_LEVEL_BAND_PCT);
+  const inBand    = cmp >= lowerBand && cmp <= upperBand;
+
+  if (!_proBandState[sym]) _proBandState[sym] = { inBand: false };
+  const wasInBand = _proBandState[sym].inBand;
+
+  if (inBand && !wasInBand) {
+    const pattern = _currentDirectionalPattern(support, resistance);
+    if (pattern) {
+      _proBandState[sym].inBand = true;
+      const detail = _formatDetail("CMP", fmtNum(cmp)) + _formatDetail("Price Level", fmtNum(level)) +
+                     _formatDetail("Band", `${fmtNum(lowerBand)} – ${fmtNum(upperBand)}`);
+      const title  = `🚨 Price Level + Directional Pattern Matched for ${sym}`;
+      _showTopAlert(sym, title, detail + _formatDetail("Pattern", pattern), "top-alert-pro");
+      fetch("/api/alert-notify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message:
+          `${title}\nSymbol: ${sym}\nCMP: ${fmtNum(cmp)}\nPrice Level: ${fmtNum(level)}\n` +
+          `Band: ${fmtNum(lowerBand)} - ${fmtNum(upperBand)}\nPattern: ${pattern}` }),
+      }).catch(err => console.error("[alert-notify]", err));
+    }
+  } else if (!inBand && wasInBand) {
+    _proBandState[sym].inBand = false;
+  }
+
+  /* ── 3) Rolling 5-close breakout tracker ────────────────────────────── */
+  _advanceBreakoutTracker(sym, cmp, isNewClose);
+}
+
+/* NEW (additive): advances/evaluates the rolling 5-close breakout window.
+   Only acts on a genuinely new closing price (isNewClose === true), not
+   on every routine 5s poll. */
+function _advanceBreakoutTracker(sym, cmp, isNewClose) {
+  if (!isNewClose) return;
+  const tr = _breakoutTracker[sym];
+  if (!tr) return;
+
+  if (!tr.complete) {
+    tr.window.push(cmp);
+    if (tr.window.length >= 5) tr.complete = true;
+    return; // still filling the first 5-point window — no breakout check yet
+  }
+
+  const windowMax = Math.max(...tr.window);
+  if (cmp > windowMax) {
+    const title = `📈 Breakout Alert for ${sym}`;
+    const detail =
+      _formatDetail("Price Level",        fmtNum(tr.level)) +
+      _formatDetail("First Crossing CMP",  fmtNum(tr.crossingCmp)) +
+      _formatDetail("Stored Closes",       tr.window.map(v => fmtNum(v)).join(", ")) +
+      _formatDetail("Previous Max",        fmtNum(windowMax)) +
+      _formatDetail("Current CMP",         fmtNum(cmp));
+    _showTopAlert(sym, title,
+      detail + `<div class="toast-detail-extra">Current closing price exceeded the previous 5-close maximum.</div>`,
+      "top-alert-breakout");
+    fetch("/api/alert-notify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message:
+        `${title}\nSymbol: ${sym}\nPrice Level: ${fmtNum(tr.level)}\nFirst Crossing CMP: ${fmtNum(tr.crossingCmp)}\n` +
+        `Stored Closes: ${tr.window.join(", ")}\nPrevious Max: ${fmtNum(windowMax)}\nCurrent CMP: ${fmtNum(cmp)}\n` +
+        `Current closing price exceeded the previous 5-close maximum.` }),
+    }).catch(err => console.error("[alert-notify]", err));
+  }
+
+  // Slide the window forward by one close either way (breakout or not).
+  tr.window.shift();
+  tr.window.push(cmp);
 }
 
 /* "Set Price Level" button in the dashboard header — a standalone
@@ -1006,6 +1116,7 @@ document.addEventListener("DOMContentLoaded", () => {
     priceLevels[activeSymbol] = newLevel;
     _priceLevelState[activeSymbol] = { side: null };
     _priceLevelDirty[activeSymbol] = true;
+    delete _breakoutTracker[activeSymbol];
     showToast("success", `🔔 Price Level Set`, `${activeSymbol} alert at ${fmtNum(newLevel)}`);
     fetch(`/api/price-level/${activeSymbol}`, {
       method: "POST",
