@@ -879,34 +879,48 @@ tbody td:first-child { text-align: left; font-weight: 600; color: var(--blue); }
   margin: 0 0 12px 0;
 }
 
-.sel-chip-price {
-  width: 92px;
-  margin-left: 6px;
-  padding: 2px 6px;
-  font-size: 0.74rem;
+/* Picker chip: three narrow level inputs instead of the old single input */
+.sel-chip-levels { display: flex; gap: 4px; margin-left: 6px; }
+.sel-chip-level-input {
+  width: 52px;
+  padding: 2px 5px;
+  font-size: 0.7rem;
   background: var(--surface3);
   border: 1px solid var(--border);
   border-radius: var(--radius-xs);
   color: var(--text);
 }
-.sel-chip-price:focus { outline: none; border-color: var(--blue); }
+.sel-chip-level-input:focus { outline: none; border-color: var(--blue); }
+.sel-chip-level-input.pl-entry  { border-color: rgba(88,166,255,0.4); }
+.sel-chip-level-input.pl-target { border-color: rgba(63,185,80,0.4); }
+.sel-chip-level-input.pl-sl     { border-color: rgba(248,81,73,0.4); }
 
-/* Dashboard header: Set Price Level control */
-.price-level-wrap {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-}
+/* NEW (additive): THREE INDEPENDENT PRICE LEVELS (Entry / Target / SL) */
 .price-level-label {
   font-size: 0.6rem;
   text-transform: uppercase;
   letter-spacing: 0.8px;
   color: var(--text-muted);
 }
-.price-level-input-row { display: flex; gap: 6px; }
+.price-level-multi-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+.price-level-fields-row { display: flex; gap: 6px; align-items: flex-end; }
+.price-level-field-group { display: flex; flex-direction: column; gap: 2px; }
+.price-level-field-group label {
+  font-size: 0.58rem;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-muted);
+}
+.pl-entry-label  { color: var(--blue); }
+.pl-target-label { color: var(--green); }
+.pl-sl-label     { color: var(--red); }
 .price-level-input {
-  width: 110px;
+  width: 82px;
   padding: 5px 8px;
   font-size: 0.8rem;
   background: var(--surface2);
@@ -925,6 +939,7 @@ tbody td:first-child { text-align: left; font-weight: 600; color: var(--blue); }
   border-radius: var(--radius-xs);
   cursor: pointer;
   transition: var(--transition);
+  align-self: flex-end;
 }
 .set-price-btn:hover { background: var(--blue); color: #05121f; }
 
@@ -993,7 +1008,8 @@ tbody td:first-child { text-align: left; font-weight: 600; color: var(--blue); }
 .top-alert-pro .top-alert-body strong { color: var(--yellow); }
 
 @media (max-width: 560px) {
-  .price-level-input { width: 84px; }
+  .price-level-field-group input.price-level-input { width: 64px; }
+  .sel-chip-level-input { width: 42px; }
   .top-alert-container { width: 94vw; }
 }
 

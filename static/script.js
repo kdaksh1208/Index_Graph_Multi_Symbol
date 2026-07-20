@@ -33,7 +33,7 @@ let _activeTab   = "indices";
 let _searchQuery = "";
 
 /* NEW (additive): optional per-symbol price levels entered at the picker
-   stage. Purely additional state — does not affect symbol selection. */
+   stage. Now an object per symbol: { entry, target, sl }. */
 let _priceLevels = {};
 
 /* Poll /api/available-symbols until fetched=true */
@@ -128,23 +128,27 @@ function _renderChips() {
     return;
   }
   wrap.classList.remove("hidden");
-  chips.innerHTML = [..._selectedSet].map(sym =>
-    `<span class="sel-chip">${sym}
-      <input type="number" step="any" class="sel-chip-price" data-sym="${sym}"
-             placeholder="Alert price" title="Optional price level alert for ${sym}"
-             value="${_priceLevels[sym] ?? ""}">
+  chips.innerHTML = [..._selectedSet].map(sym => {
+    const lv = _priceLevels[sym] || {};
+    return `<span class="sel-chip">${sym}
+      <span class="sel-chip-levels">
+        <input type="number" step="any" class="sel-chip-level-input pl-entry" data-sym="${sym}" data-key="entry" placeholder="Entry" title="Entry level for ${sym}" value="${lv.entry ?? ""}">
+        <input type="number" step="any" class="sel-chip-level-input pl-target" data-sym="${sym}" data-key="target" placeholder="Target" title="Target level for ${sym}" value="${lv.target ?? ""}">
+        <input type="number" step="any" class="sel-chip-level-input pl-sl" data-sym="${sym}" data-key="sl" placeholder="SL" title="Stop Loss level for ${sym}" value="${lv.sl ?? ""}">
+      </span>
       <button class="sel-chip-x" data-sym="${sym}" title="Remove">×</button>
-    </span>`
-  ).join("");
+    </span>`;
+  }).join("");
   chips.querySelectorAll(".sel-chip-x").forEach(btn => {
     btn.addEventListener("click", () => _toggleSymbol(btn.dataset.sym));
   });
-  // NEW (additive): capture the optional per-symbol price level
-  chips.querySelectorAll(".sel-chip-price").forEach(inp => {
+  // NEW (additive): capture the three optional per-symbol levels
+  chips.querySelectorAll(".sel-chip-level-input").forEach(inp => {
     inp.addEventListener("input", () => {
-      const sym = inp.dataset.sym;
-      if (inp.value === "") { delete _priceLevels[sym]; }
-      else { _priceLevels[sym] = inp.value; }
+      const sym = inp.dataset.sym, key = inp.dataset.key;
+      if (!_priceLevels[sym]) _priceLevels[sym] = {};
+      if (inp.value === "") { delete _priceLevels[sym][key]; }
+      else { _priceLevels[sym][key] = inp.value; }
     });
   });
 }
@@ -296,10 +300,9 @@ function _initDashboard(symbols) {
   document.getElementById("priceLabelText").textContent = activeSymbol;
 
   // NEW (additive): seed price levels captured at the picker stage,
-  // then reflect the active symbol's level in the header input.
+  // then reflect the active symbol's levels in the header inputs.
   _initPriceLevelsFromPicker(symbols);
-  const _plInput = document.getElementById("priceLevelInput");
-  if (_plInput) _plInput.value = priceLevels[activeSymbol] ?? "";
+  _reflectPriceLevelInputs(activeSymbol);
 
   initCharts();
   _resetCheckboxes();
@@ -330,9 +333,8 @@ function onSymbolChange(sym) {
   const label = document.getElementById("priceLabelText");
   if (label) label.textContent = sym;
 
-  // NEW (additive): show this symbol's own price level in the header control
-  const _plInput = document.getElementById("priceLevelInput");
-  if (_plInput) _plInput.value = priceLevels[sym] ?? "";
+  // NEW (additive): show this symbol's own levels in the header controls
+  _reflectPriceLevelInputs(sym);
 
   if (symState[sym]?.firstDataLoaded && _cachedApiResponse[sym]) {
     const { support, resistance, current, status: st } = _cachedApiResponse[sym];
@@ -863,56 +865,70 @@ function fmtDelta(n) {
 }
 
 /* ══════════════════════════════════════════════════════════════
-   NEW (additive): PRICE LEVEL ALERT SYSTEM
-   - Does not modify the existing directional alert system above
-     (evaluateAlertConditions, _getPattern, _threshold, _showPopupAlert,
-     _notifyBackendAlert are all left completely untouched).
-   - Adds: symbol-wise price level storage, a "Price Level" alert,
-     and a combined "Pro-Level" alert (price level + existing
-     directional pattern condition), shown in a dedicated TOP
-     container — never in the existing bottom-left/right toasts.
+   NEW (additive): THREE INDEPENDENT PRICE LEVELS (Entry / Target / SL)
+   - The crossing-detection algorithm and the 5-close rolling breakout
+     algorithm are UNCHANGED from the single-level implementation —
+     they are only now applied independently per level key.
+   - Only ONE breakout tracking session is ever active per symbol: the
+     most recently crossed level. Crossing a different configured level
+     discards the in-progress tracker and starts a fresh one.
    ══════════════════════════════════════════════════════════════ */
 
-/* symbol -> active numeric price level used by the dashboard */
-const priceLevels = {};
+const LEVEL_KEYS   = ["entry", "target", "sl"];
+const LEVEL_LABELS = { entry: "Entry", target: "Target", sl: "SL" };
 
-/* symbol -> { side: 'above' | 'below' | 'equal' | null } — used only to
-   detect a match/cross event instead of re-firing every single poll. */
-const _priceLevelState = {};
+/* symbol -> { entry, target, sl } active numeric levels */
+const priceLevelsMulti = {};
 
-/* Tracks whether a price level was freshly set by the user (picker or Set button)
-   so the first evaluation fires an alert when price equals the level, without
-   re-triggering on subsequent polls. Never set on page refresh. */
-const _priceLevelDirty = {};
+/* symbol -> { entry:{side}, target:{side}, sl:{side} } */
+const _priceLevelStateMulti = {};
 
-/* NEW (additive): ±0.1% band tolerance used ONLY by the combined
-   "Price Level + Directional" (Pro-Level) alert. The plain Price Level
-   alert's crossing behaviour above/below the exact level is unchanged. */
+/* symbol -> { entry:bool, target:bool, sl:bool } — freshly-set flags,
+   same purpose as the old single-level dirty flag, per key now. */
+const _priceLevelDirtyMulti = {};
+
+/* NEW: ±0.1% band tolerance for the combined Pro-Level alert (unchanged
+   from before), applied independently per level key. */
 const PRO_LEVEL_BAND_PCT = 0.001;
 
-/* NEW (additive): symbol -> whether CMP is currently inside the Pro-Level
-   band, so the combined alert fires once per entry into the band rather
-   than on every poll while price stays inside it. */
-const _proBandState = {};
+/* symbol -> { entry:{inBand}, target:{inBand}, sl:{inBand} } */
+const _proBandStateMulti = {};
 
-/* NEW (additive): symbol -> the active rolling 5-close breakout tracker,
-   started fresh by the most recent plain Price Level crossing. A new
-   crossing always replaces any in-progress tracker for that symbol,
-   satisfying "independently for every price level crossing". */
+/* symbol -> the single active rolling 5-close breakout tracker, tagged
+   with which level key (entry/target/sl) currently owns it. */
 const _breakoutTracker = {};
 
 function _initPriceLevelsFromPicker(symbols) {
   symbols.forEach(sym => {
-    const raw = _priceLevels[sym];
-    if (raw !== undefined && raw !== "" && !isNaN(parseFloat(raw))) {
-      priceLevels[sym] = parseFloat(raw);
-      _priceLevelDirty[sym] = true;
-    }
-    _priceLevelState[sym] = { side: null };
+    const raw = _priceLevels[sym] || {};
+    priceLevelsMulti[sym]      = {};
+    _priceLevelStateMulti[sym] = {};
+    _priceLevelDirtyMulti[sym] = {};
+    _proBandStateMulti[sym]    = {};
+    LEVEL_KEYS.forEach(key => {
+      _priceLevelStateMulti[sym][key] = { side: null };
+      _proBandStateMulti[sym][key]    = { inBand: false };
+      const v = raw[key];
+      if (v !== undefined && v !== "" && !isNaN(parseFloat(v))) {
+        priceLevelsMulti[sym][key] = parseFloat(v);
+        _priceLevelDirtyMulti[sym][key] = true;
+      }
+    });
   });
 }
 
-/* Dedicated TOP-of-screen alert renderer (Price Level / Pro-Level / Breakout only). */
+/* Reflect a symbol's three levels into the dashboard header inputs. */
+function _reflectPriceLevelInputs(sym) {
+  const lv = priceLevelsMulti[sym] || {};
+  const e = document.getElementById("priceLevelEntryInput");
+  const t = document.getElementById("priceLevelTargetInput");
+  const s = document.getElementById("priceLevelSLInput");
+  if (e) e.value = lv.entry  ?? "";
+  if (t) t.value = lv.target ?? "";
+  if (s) s.value = lv.sl     ?? "";
+}
+
+/* Dedicated TOP-of-screen alert renderer (unchanged). */
 function _showTopAlert(sym, title, bodyHtml, cssClass, duration = ALERT_DURATION_MS) {
   const c = document.getElementById("topAlertContainer");
   if (!c) return;
@@ -926,9 +942,8 @@ function _showTopAlert(sym, title, bodyHtml, cssClass, duration = ALERT_DURATION
   setTimeout(() => _removeEl(el), duration);
 }
 
-/* Reads whether the EXISTING directional pattern condition currently holds,
-   by reusing the existing pure helper `_getPattern` (read-only use — the
-   helper itself is not modified). */
+/* Reads the existing directional pattern condition (read-only reuse of
+   the unmodified _getPattern helper). */
 function _currentDirectionalPattern(support, resistance) {
   if (!Array.isArray(support) || support.length < 2 || !Array.isArray(resistance) || resistance.length < 2) return null;
   const sc = support.at(-1), rc = resistance.at(-1);
@@ -939,131 +954,135 @@ function _currentDirectionalPattern(support, resistance) {
   return (sP && rP && sP === rP) ? sP : null;
 }
 
-/* After a price-level crossing alert fires, ask whether to change the level. */
-function _promptPriceLevelUpdate(sym) {
-  const changeIt = confirm(`Do you want to change the price level for ${sym}? (OK = Yes, Cancel = No)`);
+/* After a level-crossing alert fires, ask whether to change that
+   specific level (Entry/Target/SL). Editing it invalidates its
+   breakout tracker if that level currently owns it. */
+function _promptPriceLevelUpdate(sym, key) {
+  const label = LEVEL_LABELS[key] || "Level";
+  const changeIt = confirm(`Do you want to change the ${label} level for ${sym}? (OK = Yes, Cancel = No)`);
   if (!changeIt) return;
-  const val = prompt(`Enter new price level for ${sym}:`, priceLevels[sym] ?? "");
+  const current = priceLevelsMulti[sym]?.[key] ?? "";
+  const val = prompt(`Enter new ${label} level for ${sym}:`, current);
   if (val === null || val.trim() === "" || isNaN(parseFloat(val))) return;
   const newLevel = parseFloat(val);
-  priceLevels[sym] = newLevel;
-  _priceLevelState[sym] = { side: null };
-  _priceLevelDirty[sym] = true;
-  delete _breakoutTracker[sym];
-  if (sym === activeSymbol) {
-    const inp = document.getElementById("priceLevelInput");
-    if (inp) inp.value = newLevel;
-  }
+
+  if (!priceLevelsMulti[sym]) priceLevelsMulti[sym] = {};
+  priceLevelsMulti[sym][key] = newLevel;
+  if (!_priceLevelStateMulti[sym]) _priceLevelStateMulti[sym] = {};
+  _priceLevelStateMulti[sym][key] = { side: null };
+  if (!_priceLevelDirtyMulti[sym]) _priceLevelDirtyMulti[sym] = {};
+  _priceLevelDirtyMulti[sym][key] = true;
+  if (_breakoutTracker[sym] && _breakoutTracker[sym].key === key) delete _breakoutTracker[sym];
+
+  if (sym === activeSymbol) _reflectPriceLevelInputs(sym);
+
   fetch(`/api/price-level/${sym}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ price_level: newLevel }),
+    body: JSON.stringify({ levels: priceLevelsMulti[sym] }),
   }).catch(err => console.error("[price-level-update]", err));
 }
 
 /* ══════════════════════════════════════════════════════════════
-   Core evaluator — three independent alerts, sharing the same
-   configured price level, but each with its own trigger condition:
-
-   1) Plain "Price Level" alert (2nd alert) — UNCHANGED: fires on an
-      exact crossing (side flips above/below, or exact equality on
-      first set). Also (NEW) kicks off the rolling 5-close breakout
-      tracker described in Feature 2.
-
-   2) "Price Level + Directional" alert (3rd alert) — NEW: instead of
-      requiring CMP to exactly equal the level, fires whenever CMP is
-      within a ±0.1% band around the level AND the existing directional
-      pattern condition also currently holds. Fires once per entry into
-      the band.
-
-   3) Breakout alert (NEW, Feature 2) — once the plain Price Level alert
-      fires, the next 5 closing CMPs are stored. Once that window is
-      full, each subsequent closing price is compared against the
-      window's maximum; if it exceeds it, a breakout alert fires, and
-      the window slides forward by one close either way.
+   Core evaluator — runs the UNCHANGED single-level algorithm
+   (crossing detection → level alert → 5-close breakout tracking)
+   independently for entry/target/sl. Whichever level is crossed
+   MOST RECENTLY becomes the sole active breakout tracker; crossing
+   a different level discards the previous tracker and its stored
+   closes, exactly as specified.
    ══════════════════════════════════════════════════════════════ */
 function evaluatePriceLevelAlerts(sym, support, resistance, current, isNewClose) {
-  const level = priceLevels[sym];
-  if (level === undefined || level === null || level === "" || isNaN(level)) return;
+  const levels = priceLevelsMulti[sym];
+  if (!levels) return;
   if (!current || current.cmp === undefined || current.cmp === null) return;
-
   const cmp = +current.cmp;
-  // NEW: two-state side (no ambiguous "equal" middle state), so a
-  // crossing is unambiguous: exactly one flip from "above" to "below"
-  // or vice versa fires the alert. Remaining on the same side — even
-  // if CMP moves around while staying above/below — never re-fires.
-  const newSide = cmp >= level ? "above" : "below";
 
-  if (!_priceLevelState[sym]) _priceLevelState[sym] = { side: null };
-  const prevSide = _priceLevelState[sym].side;
+  if (!_priceLevelStateMulti[sym]) _priceLevelStateMulti[sym] = {};
+  if (!_priceLevelDirtyMulti[sym]) _priceLevelDirtyMulti[sym] = {};
+  if (!_proBandStateMulti[sym])    _proBandStateMulti[sym]    = {};
 
-  const justSet = _priceLevelDirty[sym] === true;
-  // On first set (dirty), just record which side CMP currently sits on —
-  // there's no "previous side" yet, so no crossing has occurred and no
-  // alert should fire. The alert only fires on a later, genuine crossing.
-  const matched = justSet ? false : (prevSide !== null && newSide !== prevSide);
+  let newlyCrossedKey = null;
 
-  if (justSet) _priceLevelDirty[sym] = false;
-  _priceLevelState[sym].side = newSide;
-  /* ── 1) Plain Price Level alert — crossing logic unchanged ─────────── */
-  if (matched) {
-    const detail = _formatDetail("CMP", fmtNum(cmp)) + _formatDetail("Price Level", fmtNum(level));
-    const title  = `🔔 Price Level Matched for ${sym}`;
-    _showTopAlert(sym, title, detail, "top-alert-price");
-    fetch("/api/alert-notify", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message:
-        `${title}\nSymbol: ${sym}\nCMP: ${fmtNum(cmp)}\nPrice Level: ${fmtNum(level)}` }),
-    }).catch(err => console.error("[alert-notify]", err));
+  LEVEL_KEYS.forEach(key => {
+    const level = levels[key];
+    if (level === undefined || level === null || isNaN(level)) return;
 
-    // NEW (additive): (re)start the rolling 5-close breakout tracker for
-    // this symbol — independent for every new crossing.
-    _breakoutTracker[sym] = {
-      level,
-      crossingCmp: cmp,
-      window: [],
-      complete: false,
-    };
+    // Same two-state crossing logic as the original single-level system.
+    const newSide = cmp >= level ? "above" : "below";
+    if (!_priceLevelStateMulti[sym][key]) _priceLevelStateMulti[sym][key] = { side: null };
+    const prevSide = _priceLevelStateMulti[sym][key].side;
 
-    setTimeout(() => _promptPriceLevelUpdate(sym), 300);
-  }
+    const justSet = _priceLevelDirtyMulti[sym][key] === true;
+    const matched = justSet ? false : (prevSide !== null && newSide !== prevSide);
+    if (justSet) _priceLevelDirtyMulti[sym][key] = false;
+    _priceLevelStateMulti[sym][key].side = newSide;
 
-  /* ── 2) Price Level + Directional (Pro-Level) alert — ±0.1% band ───── */
-  const lowerBand = level * (1 - PRO_LEVEL_BAND_PCT);
-  const upperBand = level * (1 + PRO_LEVEL_BAND_PCT);
-  const inBand    = cmp >= lowerBand && cmp <= upperBand;
-
-  if (!_proBandState[sym]) _proBandState[sym] = { inBand: false };
-  const wasInBand = _proBandState[sym].inBand;
-
-  if (inBand && !wasInBand) {
-    const pattern = _currentDirectionalPattern(support, resistance);
-    if (pattern) {
-      _proBandState[sym].inBand = true;
-      const detail = _formatDetail("CMP", fmtNum(cmp)) + _formatDetail("Price Level", fmtNum(level)) +
-                     _formatDetail("Band", `${fmtNum(lowerBand)} – ${fmtNum(upperBand)}`);
-      const title  = `🚨 Price Level + Directional Pattern Matched for ${sym}`;
-      _showTopAlert(sym, title, detail + _formatDetail("Pattern", pattern), "top-alert-pro");
+    /* ── Level alert — unchanged crossing behaviour, per level ───────── */
+    if (matched) {
+      const label = LEVEL_LABELS[key];
+      const detail = _formatDetail("CMP", fmtNum(cmp)) + _formatDetail(`${label} Level`, fmtNum(level));
+      const title  = `🔔 ${label} Level Matched for ${sym}`;
+      _showTopAlert(sym, title, detail, "top-alert-price");
       fetch("/api/alert-notify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message:
-          `${title}\nSymbol: ${sym}\nCMP: ${fmtNum(cmp)}\nPrice Level: ${fmtNum(level)}\n` +
-          `Band: ${fmtNum(lowerBand)} - ${fmtNum(upperBand)}\nPattern: ${pattern}` }),
+          `${title}\nSymbol: ${sym}\nLevel Type: ${label}\nCMP: ${fmtNum(cmp)}\n${label} Level: ${fmtNum(level)}` }),
       }).catch(err => console.error("[alert-notify]", err));
+
+      newlyCrossedKey = key; // most recent crossing wins (see below)
+      setTimeout(() => _promptPriceLevelUpdate(sym, key), 300);
     }
-  } else if (!inBand && wasInBand) {
-    _proBandState[sym].inBand = false;
+
+    /* ── Pro-Level (±0.1% band + directional), independently per level ── */
+    const lowerBand = level * (1 - PRO_LEVEL_BAND_PCT);
+    const upperBand = level * (1 + PRO_LEVEL_BAND_PCT);
+    const inBand    = cmp >= lowerBand && cmp <= upperBand;
+    if (!_proBandStateMulti[sym][key]) _proBandStateMulti[sym][key] = { inBand: false };
+    const wasInBand = _proBandStateMulti[sym][key].inBand;
+
+    if (inBand && !wasInBand) {
+      const pattern = _currentDirectionalPattern(support, resistance);
+      if (pattern) {
+        _proBandStateMulti[sym][key].inBand = true;
+        const label = LEVEL_LABELS[key];
+        const detail = _formatDetail("CMP", fmtNum(cmp)) + _formatDetail(`${label} Level`, fmtNum(level)) +
+                       _formatDetail("Band", `${fmtNum(lowerBand)} – ${fmtNum(upperBand)}`);
+        const title  = `🚨 ${label} Level + Directional Pattern Matched for ${sym}`;
+        _showTopAlert(sym, title, detail + _formatDetail("Pattern", pattern), "top-alert-pro");
+        fetch("/api/alert-notify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message:
+            `${title}\nSymbol: ${sym}\nLevel Type: ${label}\nCMP: ${fmtNum(cmp)}\n${label} Level: ${fmtNum(level)}\n` +
+            `Band: ${fmtNum(lowerBand)} - ${fmtNum(upperBand)}\nPattern: ${pattern}` }),
+        }).catch(err => console.error("[alert-notify]", err));
+      }
+    } else if (!inBand && wasInBand) {
+      _proBandStateMulti[sym][key].inBand = false;
+    }
+  });
+
+  /* ── Active tracking rule: newest crossed level always wins. Discard
+     any in-progress tracker (and its stored closes) the instant a
+     different level is crossed, and start fresh for the new one. ──── */
+  if (newlyCrossedKey) {
+    _breakoutTracker[sym] = {
+      key: newlyCrossedKey,
+      level: levels[newlyCrossedKey],
+      crossingCmp: cmp,
+      window: [],
+      complete: false,
+    };
   }
 
-  /* ── 3) Rolling 5-close breakout tracker ────────────────────────────── */
+  /* ── Rolling 5-close breakout — UNCHANGED algorithm, applied only to
+     whichever level currently owns the single active tracker. ──────── */
   _advanceBreakoutTracker(sym, cmp, isNewClose);
 }
 
-/* NEW (additive): advances/evaluates the rolling 5-close breakout window.
-   Only acts on a genuinely new closing price (isNewClose === true), not
-   on every routine 5s poll. */
+/* UNCHANGED breakout algorithm; only the alert copy now names which
+   level (Entry/Target/SL) is being tracked. */
 function _advanceBreakoutTracker(sym, cmp, isNewClose) {
   if (!isNewClose) return;
   const tr = _breakoutTracker[sym];
@@ -1072,18 +1091,19 @@ function _advanceBreakoutTracker(sym, cmp, isNewClose) {
   if (!tr.complete) {
     tr.window.push(cmp);
     if (tr.window.length >= 5) tr.complete = true;
-    return; // still filling the first 5-point window — no breakout check yet
+    return;
   }
 
   const windowMax = Math.max(...tr.window);
   if (cmp > windowMax) {
-    const title = `📈 Breakout Alert for ${sym}`;
+    const label = LEVEL_LABELS[tr.key] || "Level";
+    const title = `📈 ${label} Breakout Alert for ${sym}`;
     const detail =
-      _formatDetail("Price Level",        fmtNum(tr.level)) +
-      _formatDetail("First Crossing CMP",  fmtNum(tr.crossingCmp)) +
-      _formatDetail("Stored Closes",       tr.window.map(v => fmtNum(v)).join(", ")) +
-      _formatDetail("Previous Max",        fmtNum(windowMax)) +
-      _formatDetail("Current CMP",         fmtNum(cmp));
+      _formatDetail(`${label} Level`,     fmtNum(tr.level)) +
+      _formatDetail("First Crossing CMP", fmtNum(tr.crossingCmp)) +
+      _formatDetail("Stored Closes",      tr.window.map(v => fmtNum(v)).join(", ")) +
+      _formatDetail("Previous Max",       fmtNum(windowMax)) +
+      _formatDetail("Current CMP",        fmtNum(cmp));
     _showTopAlert(sym, title,
       detail + `<div class="toast-detail-extra">Current closing price exceeded the previous 5-close maximum.</div>`,
       "top-alert-breakout");
@@ -1091,37 +1111,57 @@ function _advanceBreakoutTracker(sym, cmp, isNewClose) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message:
-        `${title}\nSymbol: ${sym}\nPrice Level: ${fmtNum(tr.level)}\nFirst Crossing CMP: ${fmtNum(tr.crossingCmp)}\n` +
+        `${title}\nSymbol: ${sym}\nLevel Type: ${label}\n${label} Level: ${fmtNum(tr.level)}\nFirst Crossing CMP: ${fmtNum(tr.crossingCmp)}\n` +
         `Stored Closes: ${tr.window.join(", ")}\nPrevious Max: ${fmtNum(windowMax)}\nCurrent CMP: ${fmtNum(cmp)}\n` +
         `Current closing price exceeded the previous 5-close maximum.` }),
     }).catch(err => console.error("[alert-notify]", err));
   }
 
-  // Slide the window forward by one close either way (breakout or not).
   tr.window.shift();
   tr.window.push(cmp);
 }
 
-/* "Set Price Level" button in the dashboard header — a standalone
-   listener added independently of the existing boot sequence below. */
+/* "Set" button in the dashboard header — reads all three fields at once. */
 document.addEventListener("DOMContentLoaded", () => {
-  const btn = document.getElementById("setPriceLevelBtn");
-  const inp = document.getElementById("priceLevelInput");
-  if (!btn || !inp) return;
+  const btn  = document.getElementById("setPriceLevelBtn");
+  const eInp = document.getElementById("priceLevelEntryInput");
+  const tInp = document.getElementById("priceLevelTargetInput");
+  const sInp = document.getElementById("priceLevelSLInput");
+  if (!btn || !eInp || !tInp || !sInp) return;
   btn.addEventListener("click", () => {
     if (!activeSymbol) return;
-    const val = inp.value;
-    if (val === "" || isNaN(parseFloat(val))) return;
-    const newLevel = parseFloat(val);
-    priceLevels[activeSymbol] = newLevel;
-    _priceLevelState[activeSymbol] = { side: null };
-    _priceLevelDirty[activeSymbol] = true;
-    delete _breakoutTracker[activeSymbol];
-    showToast("success", `🔔 Price Level Set`, `${activeSymbol} alert at ${fmtNum(newLevel)}`);
+    const parsed = {};
+    [["entry", eInp], ["target", tInp], ["sl", sInp]].forEach(([key, inp]) => {
+      if (inp.value !== "" && !isNaN(parseFloat(inp.value))) parsed[key] = parseFloat(inp.value);
+    });
+
+    if (!priceLevelsMulti[activeSymbol])      priceLevelsMulti[activeSymbol]      = {};
+    if (!_priceLevelStateMulti[activeSymbol]) _priceLevelStateMulti[activeSymbol] = {};
+    if (!_priceLevelDirtyMulti[activeSymbol]) _priceLevelDirtyMulti[activeSymbol] = {};
+
+    LEVEL_KEYS.forEach(key => {
+      if (parsed[key] !== undefined) {
+        priceLevelsMulti[activeSymbol][key] = parsed[key];
+        _priceLevelStateMulti[activeSymbol][key] = { side: null };
+        _priceLevelDirtyMulti[activeSymbol][key] = true;
+        if (_breakoutTracker[activeSymbol] && _breakoutTracker[activeSymbol].key === key) {
+          delete _breakoutTracker[activeSymbol];
+        }
+      } else {
+        delete priceLevelsMulti[activeSymbol][key];
+      }
+    });
+
+    const summary = LEVEL_KEYS
+      .filter(k => priceLevelsMulti[activeSymbol][k] !== undefined)
+      .map(k => `${LEVEL_LABELS[k]} ${fmtNum(priceLevelsMulti[activeSymbol][k])}`)
+      .join(", ") || "cleared";
+    showToast("success", `🔔 Price Levels Set`, `${activeSymbol}: ${summary}`);
+
     fetch(`/api/price-level/${activeSymbol}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ price_level: newLevel }),
+      body: JSON.stringify({ levels: priceLevelsMulti[activeSymbol] }),
     }).catch(err => console.error("[price-level-set]", err));
   });
 });
@@ -1141,9 +1181,17 @@ document.addEventListener("DOMContentLoaded", () => {
           const plResp = await fetch("/api/price-levels");
           const plData = await plResp.json();
           if (plData && typeof plData === "object") {
-            for (const [sym, level] of Object.entries(plData)) {
-              priceLevels[sym] = parseFloat(level);
-              _priceLevelState[sym] = { side: null };
+            for (const [sym, levels] of Object.entries(plData)) {
+              priceLevelsMulti[sym]      = {};
+              _priceLevelStateMulti[sym] = {};
+              _proBandStateMulti[sym]    = {};
+              LEVEL_KEYS.forEach(key => {
+                _priceLevelStateMulti[sym][key] = { side: null };
+                _proBandStateMulti[sym][key]    = { inBand: false };
+                if (levels && levels[key] !== undefined && levels[key] !== null) {
+                  priceLevelsMulti[sym][key] = parseFloat(levels[key]);
+                }
+              });
             }
           }
         } catch (_) {}
@@ -1256,17 +1304,19 @@ async function _initDashboardResumed(symbols, clientState) {
 
   // Restore the additive Price-Level / Pro-Level / Breakout feature state
   // exactly as it was when saved (does not touch the systems themselves).
-  if (clientState.priceLevels) {
-    Object.entries(clientState.priceLevels).forEach(([sym, lvl]) => { priceLevels[sym] = lvl; });
+  if (clientState.priceLevelsMulti) {
+    Object.entries(clientState.priceLevelsMulti).forEach(([sym, lv]) => { priceLevelsMulti[sym] = lv || {}; });
   }
-  if (clientState.priceLevelSide) {
-    Object.entries(clientState.priceLevelSide).forEach(([sym, side]) => {
-      _priceLevelState[sym] = { side: side ?? null };
+  if (clientState.priceLevelSideMulti) {
+    Object.entries(clientState.priceLevelSideMulti).forEach(([sym, sides]) => {
+      _priceLevelStateMulti[sym] = {};
+      LEVEL_KEYS.forEach(key => { _priceLevelStateMulti[sym][key] = { side: (sides && sides[key]) ?? null }; });
     });
   }
-  if (clientState.proBandState) {
-    Object.entries(clientState.proBandState).forEach(([sym, inBand]) => {
-      _proBandState[sym] = { inBand: !!inBand };
+  if (clientState.proBandStateMulti) {
+    Object.entries(clientState.proBandStateMulti).forEach(([sym, bands]) => {
+      _proBandStateMulti[sym] = {};
+      LEVEL_KEYS.forEach(key => { _proBandStateMulti[sym][key] = { inBand: !!(bands && bands[key]) }; });
     });
   }
   if (clientState.breakoutTrackers) {
@@ -1276,8 +1326,7 @@ async function _initDashboardResumed(symbols, clientState) {
   }
   if (clientState.cycleIntervalMs) CYCLE_INTERVAL = clientState.cycleIntervalMs;
 
-  const _plInput = document.getElementById("priceLevelInput");
-  if (_plInput) _plInput.value = priceLevels[activeSymbol] ?? "";
+  _reflectPriceLevelInputs(activeSymbol);
 
   initCharts();
   _resetCheckboxes();
@@ -1342,20 +1391,26 @@ document.addEventListener("DOMContentLoaded", () => {
     // restore it exactly. Does not read/alter any core alert logic.
     const alertHistory = {};
     const breakoutTrackers = {};
-    const priceLevelSide = {};
-    const proBandState = {};
+    const priceLevelSideMulti = {};
+    const proBandStateMulti = {};
     Object.keys(symState).forEach(sym => {
       alertHistory[sym] = [...(symState[sym].alertHistory || [])];
     });
     Object.keys(_breakoutTracker).forEach(sym => { breakoutTrackers[sym] = _breakoutTracker[sym]; });
-    Object.keys(_priceLevelState).forEach(sym => { priceLevelSide[sym] = _priceLevelState[sym].side; });
-    Object.keys(_proBandState).forEach(sym => { proBandState[sym] = _proBandState[sym].inBand; });
+    Object.keys(_priceLevelStateMulti).forEach(sym => {
+      priceLevelSideMulti[sym] = {};
+      LEVEL_KEYS.forEach(key => { priceLevelSideMulti[sym][key] = _priceLevelStateMulti[sym]?.[key]?.side ?? null; });
+    });
+    Object.keys(_proBandStateMulti).forEach(sym => {
+      proBandStateMulti[sym] = {};
+      LEVEL_KEYS.forEach(key => { proBandStateMulti[sym][key] = !!_proBandStateMulti[sym]?.[key]?.inBand; });
+    });
 
     const client_state = {
       activeSymbol,
-      priceLevels: { ...priceLevels },
-      priceLevelSide,
-      proBandState,
+      priceLevelsMulti: JSON.parse(JSON.stringify(priceLevelsMulti)),
+      priceLevelSideMulti,
+      proBandStateMulti,
       breakoutTrackers,
       alertHistory,
       cycleIntervalMs: CYCLE_INTERVAL,

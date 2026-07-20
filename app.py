@@ -286,7 +286,7 @@ def _fetch_option_chain(sym):
             # Read CMP
             try:
                 cmp_text = wait.until(
-                    EC.presence_of_element_located((By.ID, "header-nifty-val"))
+                    EC.presence_of_element_located((By.CLASS_NAME, "header-nifty-val"))
                 ).text.replace(",", "").strip()
                 if sym != "NIFTY":
                     try:
@@ -691,13 +691,21 @@ def api_start_analysis():
     raw_levels = body.get("price_levels") or {}
     if isinstance(raw_levels, dict):
         with _price_levels_lock:
-            for sym, lvl in raw_levels.items():
-                if lvl in (None, ""):
+            for sym, lvls in raw_levels.items():
+                if not isinstance(lvls, dict):
                     continue
-                try:
-                    price_levels[str(sym).upper()] = float(lvl)
-                except (TypeError, ValueError):
-                    pass
+                sym_u = str(sym).upper()
+                parsed = {}
+                for key in ("entry", "target", "sl"):
+                    v = lvls.get(key)
+                    if v in (None, ""):
+                        continue
+                    try:
+                        parsed[key] = float(v)
+                    except (TypeError, ValueError):
+                        pass
+                if parsed:
+                    price_levels[sym_u] = parsed
 
     # ── NEW (additive): optional user-selected analysis interval ─────────────
     raw_interval = body.get("interval_seconds")
@@ -720,19 +728,27 @@ def api_price_level(sym):
     sym = sym.upper()
     if request.method == "GET":
         with _price_levels_lock:
-            return jsonify({"symbol": sym, "price_level": price_levels.get(sym)})
+            return jsonify({"symbol": sym, "levels": price_levels.get(sym, {})})
 
-    body  = request.get_json(force=True, silent=True) or {}
-    level = body.get("price_level")
+    body   = request.get_json(force=True, silent=True) or {}
+    levels = body.get("levels")
+    if not isinstance(levels, dict):
+        return jsonify({"error": "levels object required"}), 400
+    parsed = {}
+    for key in ("entry", "target", "sl"):
+        v = levels.get(key)
+        if v in (None, ""):
+            continue
+        try:
+            parsed[key] = float(v)
+        except (TypeError, ValueError):
+            return jsonify({"error": f"{key} must be numeric"}), 400
     with _price_levels_lock:
-        if level in (None, ""):
-            price_levels.pop(sym, None)
+        if parsed:
+            price_levels[sym] = parsed
         else:
-            try:
-                price_levels[sym] = float(level)
-            except (TypeError, ValueError):
-                return jsonify({"error": "price_level must be numeric"}), 400
-    return jsonify({"symbol": sym, "price_level": price_levels.get(sym)})
+            price_levels.pop(sym, None)
+    return jsonify({"symbol": sym, "levels": price_levels.get(sym, {})})
 
 
 @app.route("/api/price-levels")
@@ -865,11 +881,20 @@ def api_resume_analysis():
         analysis_started = True
 
     with _price_levels_lock:
-        for sym, lvl in (saved.get("price_levels") or {}).items():
-            try:
-                price_levels[str(sym).upper()] = float(lvl)
-            except (TypeError, ValueError):
-                pass
+        for sym, lvls in (saved.get("price_levels") or {}).items():
+            if not isinstance(lvls, dict):
+                continue
+            parsed = {}
+            for key in ("entry", "target", "sl"):
+                v = lvls.get(key)
+                if v in (None, ""):
+                    continue
+                try:
+                    parsed[key] = float(v)
+                except (TypeError, ValueError):
+                    pass
+            if parsed:
+                price_levels[str(sym).upper()] = parsed
 
     raw_interval = saved.get("interval_seconds")
     try:

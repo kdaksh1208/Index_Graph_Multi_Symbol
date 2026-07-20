@@ -58,7 +58,7 @@
 
       <!-- NEW (additive): hint about optional per-symbol price alert -->
       <p class="picker-price-hint" id="pickerPriceHint">
-        💡 Tip: after selecting a symbol below, you can optionally set a price level for alerts next to its chip.
+        💡 Tip: after selecting a symbol below, you can optionally set Entry / Target / SL levels for alerts next to its chip.
       </p>
 
       <!-- Main selector (hidden until symbols load) -->
@@ -152,13 +152,24 @@
         <select id="symbolSelector" class="symbol-selector" onchange="onSymbolChange(this.value)"></select>
       </div>
 
-      <!-- NEW (additive): per-symbol price level alert control -->
-      <div class="price-level-wrap" id="priceLevelWrap">
-        <label class="price-level-label" for="priceLevelInput">Set Price Level</label>
-        <div class="price-level-input-row">
-          <input id="priceLevelInput" class="price-level-input" type="number" step="any"
-                 placeholder="e.g. 24500" title="Optional price level alert for the selected symbol" />
-          <button id="setPriceLevelBtn" class="set-price-btn" type="button" title="Save price level for this symbol">Set</button>
+      <!-- NEW (additive): three independent price levels — Entry / Target / SL,
+           replacing the single price-level input. -->
+      <div class="price-level-multi-wrap" id="priceLevelWrap">
+        <span class="price-level-label">Price Levels</span>
+        <div class="price-level-fields-row">
+          <div class="price-level-field-group">
+            <label class="pl-entry-label" for="priceLevelEntryInput">Entry</label>
+            <input id="priceLevelEntryInput" class="price-level-input" type="number" step="any" placeholder="e.g. 24500" />
+          </div>
+          <div class="price-level-field-group">
+            <label class="pl-target-label" for="priceLevelTargetInput">Target</label>
+            <input id="priceLevelTargetInput" class="price-level-input" type="number" step="any" placeholder="e.g. 24800" />
+          </div>
+          <div class="price-level-field-group">
+            <label class="pl-sl-label" for="priceLevelSLInput">SL</label>
+            <input id="priceLevelSLInput" class="price-level-input" type="number" step="any" placeholder="e.g. 24200" />
+          </div>
+          <button id="setPriceLevelBtn" class="set-price-btn" type="button" title="Save price levels for this symbol">Set</button>
         </div>
       </div>
 
