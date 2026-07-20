@@ -14,6 +14,8 @@ import logging
 import glob
 import signal
 import atexit
+import json
+import copy
 from datetime import datetime
 from telegram_alert import send_telegram_alert
 from alert_logger import log_alert
@@ -63,6 +65,18 @@ _price_levels_lock = threading.Lock()
 # Single source of truth for the fetch cadence, replacing the previous
 # hardcoded 120s. Default kept at 900s (0h 15m) as the new default.
 analysis_interval_seconds: int = 15 * 60
+
+# ── NEW (additive): Save & Resume Analysis storage ────────────────────────────
+# Does not interact with, replace, or alter any existing analysis state above.
+SAVE_DIR = "saved_analyses"
+os.makedirs(SAVE_DIR, exist_ok=True)
+_save_lock = threading.Lock()
+
+
+def _save_path(name):
+    safe = "".join(c for c in name if c.isalnum() or c in ("_", "-")) or "analysis"
+    return os.path.join(SAVE_DIR, f"{safe}.json")
+
 
 _state_lock    = threading.Lock()
 shutdown_event = threading.Event()
@@ -161,7 +175,6 @@ def _stop_driver():
 def _handle_shutdown(signum, frame):
     log.info("Shutdown signal %s", signum)
     shutdown_event.set()
-    _stop_driver()
     os._exit(0)
 
 
@@ -498,6 +511,54 @@ def _build_snapshot(ts, cmp, sr, spd, scd, rpd, rcd, *, is_baseline, data_change
     }
 
 
+# ── NEW (additive): resumed per-symbol data loop ──────────────────────────────
+def _data_loop_for_symbol_resumed(sym):
+    """
+    Continues a previously saved per-symbol loop. Mirrors the recurring
+    section of _data_loop_for_symbol exactly, but skips the initial
+    baseline fetch (the loaded history already has it) and waits one full
+    analysis_interval_seconds before the first new fetch, per the
+    "continue at the next scheduled interval" requirement.
+    _data_loop_for_symbol itself is left completely untouched.
+    """
+    if shutdown_event.is_set():
+        return
+
+    while True:
+        if _sleep_or_stop(analysis_interval_seconds):
+            break
+        if shutdown_event.is_set():
+            break
+        with _state_lock:
+            cycle = symbol_data[sym]["status"]["cycle"] + 1
+        try:
+            _set_status(sym, f"📥 [Cycle {cycle}] Fetching {sym}…", fetching=True, cycle=cycle)
+            df, cmp = _fetch_option_chain(sym)
+            if df is None:
+                _set_status(sym, f"⚠️ {sym} failed — retry 60s", fetching=False, error="Failed")
+                if _sleep_or_stop(60):
+                    break
+                continue
+            sr = _find_sr(df, cmp)
+            ts = datetime.now().strftime("%H:%M:%S")
+            spd, scd, rpd, rcd, changed = _compute_deltas(sym, sr)
+            with _state_lock:
+                symbol_data[sym]["history"].append(
+                    _build_snapshot(ts, cmp, sr, spd, scd, rpd, rcd,
+                                    is_baseline=False, data_changed=changed))
+            _update_strike_history(sym, df)
+            msg = (f"✅ {sym} {ts} | CMP {cmp:.2f} | Sup {sr['support']} PΔ={spd:+.0f} CΔ={scd:+.0f} | "
+                   f"Res {sr['resistance']} PΔ={rpd:+.0f} CΔ={rcd:+.0f}"
+                   if changed else f"⚠️ {sym} {ts} unchanged | CMP {cmp:.2f}")
+            _set_status(sym, msg, fetching=False, error=None, data_changed=changed)
+        except ShutdownRequested:
+            _set_status(sym, "🛑 Stopped.", fetching=False)
+            break
+        except Exception as exc:
+            log.exception("[%s] Resumed loop error", sym)
+            _set_status(sym, f"❌ {exc}", fetching=False, error=str(exc))
+
+
 # ── Per-symbol data loop (unchanged logic) ───────────────────────────────────
 def _data_loop_for_symbol(sym):
     if shutdown_event.is_set():
@@ -741,6 +802,97 @@ def api_alert_notify():
 @app.route("/api/symbols")
 def api_symbols():
     return jsonify({"symbols": active_symbols})
+
+
+# ── NEW (additive): Save & Resume Analysis endpoints ──────────────────────────
+@app.route("/api/saved-analyses")
+def api_saved_analyses():
+    with _save_lock:
+        names = [os.path.splitext(f)[0] for f in os.listdir(SAVE_DIR) if f.endswith(".json")]
+    return jsonify({"analyses": sorted(names)})
+
+
+@app.route("/api/save-analysis", methods=["POST"])
+def api_save_analysis():
+    if not analysis_started:
+        return jsonify({"error": "No active analysis to save"}), 400
+    body = request.get_json(force=True, silent=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Name required"}), 400
+
+    with _state_lock:
+        snapshot = {
+            "symbols": list(active_symbols),
+            "symbol_data": copy.deepcopy(symbol_data),
+            "interval_seconds": analysis_interval_seconds,
+        }
+    with _price_levels_lock:
+        snapshot["price_levels"] = dict(price_levels)
+    snapshot["client_state"] = body.get("client_state") or {}
+
+    with _save_lock:
+        with open(_save_path(name), "w", encoding="utf-8") as f:
+            json.dump(snapshot, f)
+    return jsonify({"ok": True, "name": name})
+
+
+@app.route("/api/resume-analysis", methods=["POST"])
+def api_resume_analysis():
+    global analysis_started, active_symbols, symbol_data, analysis_interval_seconds
+    if analysis_started:
+        return jsonify({"error": "Analysis already running"}), 400
+    body = request.get_json(force=True, silent=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Name required"}), 400
+
+    path = _save_path(name)
+    if not os.path.exists(path):
+        return jsonify({"error": "Saved analysis not found"}), 404
+
+    with _save_lock:
+        with open(path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+
+    symbols = saved.get("symbols") or []
+    if not symbols:
+        return jsonify({"error": "Saved analysis has no symbols"}), 400
+
+    with _state_lock:
+        active_symbols   = list(symbols)
+        symbol_data      = saved.get("symbol_data") or {}
+        analysis_started = True
+
+    with _price_levels_lock:
+        for sym, lvl in (saved.get("price_levels") or {}).items():
+            try:
+                price_levels[str(sym).upper()] = float(lvl)
+            except (TypeError, ValueError):
+                pass
+
+    raw_interval = saved.get("interval_seconds")
+    try:
+        iv = int(raw_interval)
+        if iv > 0:
+            analysis_interval_seconds = iv
+    except (TypeError, ValueError):
+        pass
+
+    log.info("Resuming analysis '%s': %s", name, symbols)
+    for i, sym in enumerate(symbols):
+        def _run(s=sym, d=i * 5):
+            if d > 0 and _sleep_or_stop(d):
+                return
+            _data_loop_for_symbol_resumed(s)
+        threading.Thread(target=_run, daemon=True, name=f"oi-resume-{sym}").start()
+
+    return jsonify({
+        "started": True,
+        "symbols": symbols,
+        "resumed": True,
+        "client_state": saved.get("client_state") or {},
+    })
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

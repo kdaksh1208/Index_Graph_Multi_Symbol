@@ -1142,16 +1142,239 @@ document.addEventListener("DOMContentLoaded", () => {
           const plData = await plResp.json();
           if (plData && typeof plData === "object") {
             for (const [sym, level] of Object.entries(plData)) {
-              _priceLevels[sym] = level;
+              priceLevels[sym] = parseFloat(level);
+              _priceLevelState[sym] = { side: null };
             }
           }
         } catch (_) {}
         _switchToDashboard(d.symbols);
       } else {
-        _initPicker();
+        // NEW (additive): show the startup screen instead of jumping
+        // straight into the picker, so the user can resume a saved
+        // analysis. Clicking "NEW ANALYSIS" there calls _initPicker(),
+        // which is completely unchanged.
+        _showStartupScreen();
       }
     } catch (_) {
-      _initPicker();
+      _showStartupScreen();
     }
   })();
+});
+
+/* ══════════════════════════════════════════════════════════════
+   NEW (additive): SAVE & RESUME ANALYSIS
+   - Does not modify _initPicker, _initDashboard, pollData, pollStatus,
+     evaluateAlertConditions, evaluatePriceLevelAlerts, or any chart/
+     table rendering function. Resume works by pre-seeding the same
+     state those functions already read, so they behave exactly as
+     they would for a live session that simply hasn't had a new
+     cycle yet.
+   ══════════════════════════════════════════════════════════════ */
+
+/* Fetch and render the startup screen: saved analyses + NEW ANALYSIS. */
+async function _showStartupScreen() {
+  const startupView = document.getElementById("startupView");
+  const list = document.getElementById("savedAnalysesList");
+  const newBtn = document.getElementById("newAnalysisBtn");
+  if (!startupView || !list || !newBtn) { _initPicker(); return; }
+
+  startupView.classList.remove("hidden");
+
+  let saved = [];
+  try {
+    const r = await fetch("/api/saved-analyses");
+    const d = await r.json();
+    saved = d.analyses || [];
+  } catch (_) { /* ignore, treat as no saved analyses */ }
+
+  list.innerHTML = saved.length
+    ? saved.map(name =>
+        `<button class="saved-analysis-card" data-name="${name}">💾 ${name}</button>`
+      ).join("")
+    : `<p class="no-saved-hint">No saved analyses yet.</p>`;
+
+  list.querySelectorAll(".saved-analysis-card").forEach(btn => {
+    btn.addEventListener("click", () => _resumeAnalysis(btn.dataset.name));
+  });
+
+  newBtn.addEventListener("click", () => {
+    startupView.classList.add("hidden");
+    document.getElementById("pickerView").classList.remove("hidden");
+    _initPicker(); // unchanged existing flow
+  }, { once: true });
+}
+
+/* Ask the backend to restore a saved session, then rebuild the dashboard
+   from it without performing an immediate fresh plot. */
+async function _resumeAnalysis(name) {
+  try {
+    const r = await fetch("/api/resume-analysis", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const d = await r.json();
+    if (!d.started) {
+      alert("Error resuming analysis: " + (d.error || "Unknown error"));
+      return;
+    }
+    document.getElementById("startupView").classList.add("hidden");
+    document.getElementById("dashboardView").classList.remove("hidden");
+    await _initDashboardResumed(d.symbols, d.client_state || {});
+  } catch (e) {
+    alert("Network error: " + e.message);
+  }
+}
+
+/* Rebuilds the dashboard from a resumed session:
+   Step 1: render the saved graphs/table/header AS-IS (no new-data toast,
+           no alert evaluation — this is just restoring what was saved).
+   Step 2-4: start the exact same polling loops as a live session. Since
+           lastHistoryLen is pre-seeded to the saved history length, the
+           very next genuinely new fetch (after the saved interval
+           elapses server-side) is detected by the UNCHANGED pollData()
+           exactly like any new cycle — so plotting/alerts continue as
+           an extension of the restored history, never as a fresh start. */
+async function _initDashboardResumed(symbols, clientState) {
+  symbols.forEach(sym => {
+    symState[sym] = {
+      lastHistoryLen: 0, firstDataLoaded: false,
+      lastNewDataTime: null, isDataFetchInProgress: false,
+      alertCycleCount: 0,
+      alertHistory: new Set((clientState.alertHistory && clientState.alertHistory[sym]) || []),
+    };
+  });
+
+  const sel = document.getElementById("symbolSelector");
+  const preferredActive = clientState.activeSymbol && symbols.includes(clientState.activeSymbol)
+    ? clientState.activeSymbol : symbols[0];
+  sel.innerHTML = symbols.map((s, i) =>
+    `<option value="${s}" ${s === preferredActive ? "selected" : ""}>${s}</option>`
+  ).join("");
+  activeSymbol = preferredActive;
+  document.getElementById("priceLabelText").textContent = activeSymbol;
+
+  // Restore the additive Price-Level / Pro-Level / Breakout feature state
+  // exactly as it was when saved (does not touch the systems themselves).
+  if (clientState.priceLevels) {
+    Object.entries(clientState.priceLevels).forEach(([sym, lvl]) => { priceLevels[sym] = lvl; });
+  }
+  if (clientState.priceLevelSide) {
+    Object.entries(clientState.priceLevelSide).forEach(([sym, side]) => {
+      _priceLevelState[sym] = { side: side ?? null };
+    });
+  }
+  if (clientState.proBandState) {
+    Object.entries(clientState.proBandState).forEach(([sym, inBand]) => {
+      _proBandState[sym] = { inBand: !!inBand };
+    });
+  }
+  if (clientState.breakoutTrackers) {
+    Object.entries(clientState.breakoutTrackers).forEach(([sym, tr]) => {
+      if (tr) _breakoutTracker[sym] = tr;
+    });
+  }
+  if (clientState.cycleIntervalMs) CYCLE_INTERVAL = clientState.cycleIntervalMs;
+
+  const _plInput = document.getElementById("priceLevelInput");
+  if (_plInput) _plInput.value = priceLevels[activeSymbol] ?? "";
+
+  initCharts();
+  _resetCheckboxes();
+  _applyToastPosition(activeSymbol);
+
+  // Step 1: restore saved graphs/table/header for every symbol, marking
+  // each as "already loaded" so the next poll doesn't treat this as new.
+  for (const sym of symbols) {
+    try {
+      const r = await fetch(`/api/data/${sym}`);
+      const data = await r.json();
+      _cachedApiResponse[sym] = data;
+      const ss = symState[sym];
+      ss.lastHistoryLen  = data.history_len || 0;
+      ss.firstDataLoaded = true;
+      ss.lastNewDataTime = Date.now();
+      if (sym === activeSymbol) {
+        updateHeader(data.current);
+        updateCharts(data.support || [], data.resistance || [], sym);
+        updateTable(data.support || [], data.resistance || []);
+        updateStatusUI(data.status || {}, sym);
+      }
+    } catch (e) {
+      console.error(`[resume:${sym}]`, e);
+    }
+  }
+  hideOverlay();
+
+  // Step 2-4: resume normal polling. pollData/pollStatus are completely
+  // unchanged; because lastHistoryLen is pre-seeded above, everything
+  // downstream behaves exactly as it would mid-session.
+  symbols.forEach(sym => {
+    setInterval(() => { if (!symState[sym].isDataFetchInProgress) pollData(sym); }, DATA_POLL_MS);
+  });
+
+  pollStatus();
+  setInterval(pollStatus, STATUS_POLL_MS);
+
+  setInterval(() => {
+    const phase    = document.getElementById("statusMsg")?.textContent ?? "";
+    const fetching = /downloading|clicking|opening|connecting/i.test(phase);
+    _updateCountdownDisplay(fetching);
+  }, 1000);
+
+  showToast("info", "📂 Analysis resumed",
+    `Monitoring: ${symbols.join(", ")} — continuing from saved state…`, 6000);
+}
+
+/* "Save" button — a standalone listener, independent of the boot sequence. */
+document.addEventListener("DOMContentLoaded", () => {
+  const saveBtn = document.getElementById("saveAnalysisBtn");
+  if (!saveBtn) return;
+  saveBtn.addEventListener("click", async () => {
+    if (!Object.keys(symState).length) {
+      alert("Nothing to save yet — start an analysis first.");
+      return;
+    }
+    const name = prompt("Save analysis as:", "");
+    if (!name || !name.trim()) return;
+
+    // Gather the additive-feature client-side state so a resume can
+    // restore it exactly. Does not read/alter any core alert logic.
+    const alertHistory = {};
+    const breakoutTrackers = {};
+    const priceLevelSide = {};
+    const proBandState = {};
+    Object.keys(symState).forEach(sym => {
+      alertHistory[sym] = [...(symState[sym].alertHistory || [])];
+    });
+    Object.keys(_breakoutTracker).forEach(sym => { breakoutTrackers[sym] = _breakoutTracker[sym]; });
+    Object.keys(_priceLevelState).forEach(sym => { priceLevelSide[sym] = _priceLevelState[sym].side; });
+    Object.keys(_proBandState).forEach(sym => { proBandState[sym] = _proBandState[sym].inBand; });
+
+    const client_state = {
+      activeSymbol,
+      priceLevels: { ...priceLevels },
+      priceLevelSide,
+      proBandState,
+      breakoutTrackers,
+      alertHistory,
+      cycleIntervalMs: CYCLE_INTERVAL,
+    };
+
+    try {
+      const r = await fetch("/api/save-analysis", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: name.trim(), client_state }),
+      });
+      const d = await r.json();
+      if (d.ok) {
+        showToast("success", "💾 Analysis Saved", `Saved as "${d.name}"`, 4000);
+      } else {
+        alert("Error saving: " + (d.error || "Unknown error"));
+      }
+    } catch (e) {
+      alert("Network error: " + e.message);
+    }
+  });
 });

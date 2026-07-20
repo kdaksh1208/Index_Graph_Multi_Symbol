@@ -10,9 +10,33 @@
 <body>
 
 <!-- ══════════════════════════════════════════════════════════
+     NEW (additive) VIEW 0: STARTUP — choose saved analysis or new
+     ══════════════════════════════════════════════════════════ -->
+<div id="startupView">
+  <div class="startup-bg">
+    <div class="startup-card">
+      <div class="startup-header">
+        <div class="picker-logo">📈</div>
+        <div>
+          <h1 class="startup-title">NSE OI Tracker</h1>
+          <p class="startup-sub">Resume a saved analysis, or start a new one</p>
+        </div>
+      </div>
+      <div class="startup-body">
+        <span class="startup-section-label">Saved Analyses</span>
+        <div id="savedAnalysesList" class="saved-analyses-list">
+          <p class="no-saved-hint">Loading…</p>
+        </div>
+        <button id="newAnalysisBtn" class="new-analysis-btn">▶ NEW ANALYSIS</button>
+      </div>
+    </div>
+  </div>
+</div><!-- /startupView -->
+
+<!-- ══════════════════════════════════════════════════════════
      VIEW 1: SYMBOL PICKER  (shown on load, hidden after start)
      ══════════════════════════════════════════════════════════ -->
-<div id="pickerView">
+<div id="pickerView" class="hidden">
 
   <div class="picker-bg">
     <div class="picker-card">
@@ -111,6 +135,10 @@
   <!-- Header -->
   <header class="app-header">
     <div class="header-left">
+      <!-- NEW (additive): Save Analysis -->
+      <button id="saveAnalysisBtn" class="save-analysis-btn" type="button" title="Save this analysis session">
+        💾 Save
+      </button>
       <div class="logo-badge">📈</div>
       <div class="header-titles">
         <h1>NSE OI Tracker</h1>
